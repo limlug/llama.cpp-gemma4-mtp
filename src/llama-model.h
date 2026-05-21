@@ -249,7 +249,11 @@ struct llama_mtp_block {
     // llama_model_load_mtp_overlay() (CPU-resident first cut; the scheduler
     // handles cross-backend copies at compute time). NULL when MTP tensors
     // are loaded via the standard load_arch_tensors path (combined GGUF).
-    ggml_context_ptr overlay_ctx;
+    ggml_context_ptr        overlay_ctx;
+    // CPU backend buffer wrapping overlay_ctx's heap — required so that
+    // every overlay tensor has a non-NULL t->buffer and the scheduler can
+    // route weights from CPU to a -ngl > 0 base model's backend.
+    ggml_backend_buffer_ptr overlay_buf;
 
     bool empty() const { return pre_proj == nullptr; }
 };

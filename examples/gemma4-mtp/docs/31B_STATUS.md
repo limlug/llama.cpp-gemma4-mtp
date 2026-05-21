@@ -81,16 +81,45 @@ to within F16 noise. To eliminate entirely, create the base context with
 `type_k = type_v = GGML_TYPE_F32` (requires graph_mtp's shared K/V
 tensors to be F32 too — currently hard-coded F16 to match cache type).
 
-### `llama-server` segfaults during init on GPU
+### GPU init: FIXED (2026-05-22)
 
-With `-ngl 99 --spec-type draft-mtp`, the server segfaults shortly after
-the MTP context is created but before slot init. Likely an issue in the
-speculative driver init path that's specific to multi-GPU placement
-plus 31B's wider shapes. Backtrace not yet captured (no gdb on the box).
+`-ngl 99 --spec-type draft-mtp` no longer segfaults during init. Root
+cause: `llama_model_load_mtp_overlay` loaded overlay tensors via
+`gguf_init_from_file(no_alloc=false)`, leaving them in a raw
+`ggml_context` heap with `t->buffer == NULL`. On CPU the backend reads
+directly from `t->data`, so the missing buffer is harmless; with
+`-ngl > 0` the scheduler dereferences `input->buffer` during split
+execution (`ggml_backend_buffer_get_usage`,
+`ggml_backend_buffer_is_host`) and null-derefs.
 
-Workaround for now: run with `-ngl 0` (CPU). Slow (~2 TPS for 31B) but
-working — produces coherent text and the drafter contributes 8.3%
-acceptance.
+Fix: wrap the overlay `ggml_context`'s data heap in a CPU backend
+buffer via `ggml_backend_cpu_buffer_from_ptr`, tag it
+`GGML_BACKEND_BUFFER_USAGE_WEIGHTS`, set `t->buffer` on every overlay
+tensor, and keep the buffer alive via a new `mtp.overlay_buf` field on
+the model. The scheduler can now route CPU-resident weights to a
+GPU-side compute backend lazily.
+
+Verified on llm01 (`CUDA_VISIBLE_DEVICES=4`, H100 80 GB):
+* `-ngl 99 -sm none`: coherent gen, ~12.5 TPS, server stable
+* `-ngl 99 -sm layer` across 2 GPUs: coherent gen, ~13.4 TPS, server stable
+
+### Open: 0% draft acceptance on GPU
+
+Same prompt that gives 8.3% on CPU returns 0% on GPU (`draft_n=63
+accepted=0`). F32 KV cache (`-ctk f32 -ctv f32`) doesn't help, so it
+isn't pure KV-cache precision. Drafter executes correctly through the
+GPU pipeline — drafts are generated, just rejected. Likely:
+
+* CUDA F16 cross-attention math accumulating more rounding than CPU's
+  path. The drafter was already borderline at 8.3% — small precision
+  diffs are enough to flip the argmax.
+* Possibly a stride/layout mismatch in `ggml_dup` of the cache view on
+  CUDA that doesn't surface on CPU.
+
+Next diagnostic step: extract the drafter's logits on GPU vs CPU for
+the same prompt and diff them. If cosine stays high but argmax flips,
+it's intrinsic precision; if logits diverge materially there's a
+genuine bug to chase.
 
 ### Sanity check that should be re-run before declaring this fully done
 

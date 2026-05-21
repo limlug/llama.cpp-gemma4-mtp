@@ -2880,9 +2880,29 @@ int32_t llama_model_load_mtp_overlay(llama_model * model, const char * path) {
                        __func__, hp.mtp_num_centroids, hp.mtp_centroid_top_k);
     }
 
+    // Wrap the overlay ggml_context's data heap in a CPU backend buffer
+    // tagged as WEIGHTS. Without this, every overlay tensor has
+    // t->buffer == NULL, and when the base model runs on a GPU backend
+    // (-ngl > 0) the scheduler crashes during split execution when copying
+    // these weights to the compute backend — ggml_backend_buffer_get_usage
+    // and ggml_backend_buffer_is_host both null-deref input->buffer.
+    ggml_backend_buffer_t overlay_buf = ggml_backend_cpu_buffer_from_ptr(
+            ggml_get_mem_buffer(overlay_ggml),
+            ggml_get_mem_size(overlay_ggml));
+    if (!overlay_buf) {
+        LLAMA_LOG_ERROR("%s: failed to wrap overlay ggml_context in a CPU backend buffer\n", __func__);
+        return -15;
+    }
+    ggml_backend_buffer_set_usage(overlay_buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    for (ggml_tensor * t = ggml_get_first_tensor(overlay_ggml); t != nullptr;
+                       t = ggml_get_next_tensor(overlay_ggml, t)) {
+        t->buffer = overlay_buf;
+    }
+
     // Transfer ggml context ownership to the model. The gguf context is freed
     // by the RAII helper at scope exit; the ggml context is kept alive via
     // model->mtp.overlay_ctx.
+    mtp.overlay_buf.reset(overlay_buf);
     mtp.overlay_ctx.reset(overlay_ggml);
     keep_overlay_ggml = true;
 
