@@ -224,6 +224,34 @@ class Keys:
     class KDA:
         HEAD_DIM = "{arch}.kda.head_dim"
 
+    class MTP:
+        """Multi-Token Prediction (MTP) / drafter overlay metadata.
+
+        If `HIDDEN_SIZE` is absent the runtime falls back to Qwen35-style
+        single-block MTP at the main `n_embd`. When `HIDDEN_SIZE` is present,
+        the MTP graph is built as a separate sub-model at that hidden size
+        (Gemma4 pattern: cross-attention to main model's K/V).
+        """
+        HIDDEN_SIZE              = "{arch}.mtp.hidden_size"
+        INTERMEDIATE_SIZE        = "{arch}.mtp.intermediate_size"
+        N_HEAD                   = "{arch}.mtp.attention.head_count"
+        N_HEAD_KV                = "{arch}.mtp.attention.head_count_kv"
+        HEAD_DIM                 = "{arch}.mtp.attention.head_dim"
+        GLOBAL_HEAD_DIM          = "{arch}.mtp.attention.global_head_dim"
+        SLIDING_WINDOW           = "{arch}.mtp.attention.sliding_window"
+        LAYER_NORM_EPS           = "{arch}.mtp.attention.layer_norm_rms_epsilon"
+        LAYER_TYPES              = "{arch}.mtp.layer_types"
+        ROPE_FULL_THETA_E6       = "{arch}.mtp.rope.full.theta_e6"
+        ROPE_SLIDING_THETA_E3    = "{arch}.mtp.rope.sliding.theta_e3"
+        ROPE_FULL_PARTIAL_FACTOR = "{arch}.mtp.rope.full.partial_rotary_factor"
+        # Gemma4Assistant MaskedEmbedder (use_ordered_embeddings=True variants).
+        # When USE_ORDERED_EMBEDDINGS is true, the drafter replaces plain
+        # lm_head with a sparse centroid-based top-k lookup; the relevant
+        # weights and metadata live alongside the standard MTP tensors.
+        USE_ORDERED_EMBEDDINGS   = "{arch}.mtp.use_ordered_embeddings"
+        NUM_CENTROIDS            = "{arch}.mtp.num_centroids"
+        CENTROID_TOP_K           = "{arch}.mtp.centroid_intermediate_top_k"
+
     class WKV:
         HEAD_SIZE = "{arch}.wkv.head_size"
 
@@ -862,6 +890,24 @@ class MODEL_TENSOR(IntEnum):
     NEXTN_HNORM          = auto()
     NEXTN_SHARED_HEAD_HEAD = auto()
     NEXTN_SHARED_HEAD_NORM = auto()
+    # Gemma4-style multi-block MTP (separate hidden size)
+    MTP_PRE_PROJ         = auto()  # 2*backbone × mtp_hidden
+    MTP_POST_PROJ        = auto()  # mtp_hidden × backbone
+    MTP_NORM             = auto()  # final drafter norm at mtp_hidden
+    MTP_EMBED_TOKENS     = auto()  # tied lm_head at mtp_hidden (NOT vestigial)
+    MTP_ATTN_NORM        = auto()
+    MTP_ATTN_POST_NORM   = auto()
+    MTP_FFN_PRE_NORM     = auto()
+    MTP_FFN_POST_NORM    = auto()
+    MTP_ATTN_Q           = auto()
+    MTP_ATTN_Q_NORM      = auto()
+    MTP_ATTN_OUTPUT      = auto()
+    MTP_FFN_GATE         = auto()
+    MTP_FFN_UP           = auto()
+    MTP_FFN_DOWN         = auto()
+    MTP_LAYER_SCALAR     = auto()
+    MTP_MASKED_EMB_CENTROIDS       = auto()  # [num_centroids, mtp_hidden]
+    MTP_MASKED_EMB_TOKEN_ORDERING  = auto()  # [vocab] int32 buffer
     # lfm2 audio
     A_ENC_NORM_CONV        = auto()
     A_ENC_LINEAR_POS       = auto()
@@ -1407,6 +1453,24 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.NEXTN_HNORM:               "blk.{bid}.nextn.hnorm",
     MODEL_TENSOR.NEXTN_SHARED_HEAD_HEAD:    "blk.{bid}.nextn.shared_head_head",
     MODEL_TENSOR.NEXTN_SHARED_HEAD_NORM:    "blk.{bid}.nextn.shared_head_norm",
+    # Gemma4-style MTP (separate hidden size, multi-block, cross-attention)
+    MODEL_TENSOR.MTP_PRE_PROJ:              "mtp.pre_proj",
+    MODEL_TENSOR.MTP_POST_PROJ:             "mtp.post_proj",
+    MODEL_TENSOR.MTP_NORM:                  "mtp.norm",
+    MODEL_TENSOR.MTP_EMBED_TOKENS:          "mtp.embed_tokens",
+    MODEL_TENSOR.MTP_ATTN_NORM:             "mtp.blk.{bid}.attn_norm",
+    MODEL_TENSOR.MTP_ATTN_POST_NORM:        "mtp.blk.{bid}.attn_post_norm",
+    MODEL_TENSOR.MTP_FFN_PRE_NORM:          "mtp.blk.{bid}.ffn_pre_norm",
+    MODEL_TENSOR.MTP_FFN_POST_NORM:         "mtp.blk.{bid}.ffn_post_norm",
+    MODEL_TENSOR.MTP_ATTN_Q:                "mtp.blk.{bid}.attn_q",
+    MODEL_TENSOR.MTP_ATTN_Q_NORM:           "mtp.blk.{bid}.attn_q_norm",
+    MODEL_TENSOR.MTP_ATTN_OUTPUT:           "mtp.blk.{bid}.attn_output",
+    MODEL_TENSOR.MTP_FFN_GATE:              "mtp.blk.{bid}.ffn_gate",
+    MODEL_TENSOR.MTP_FFN_UP:                "mtp.blk.{bid}.ffn_up",
+    MODEL_TENSOR.MTP_FFN_DOWN:              "mtp.blk.{bid}.ffn_down",
+    MODEL_TENSOR.MTP_LAYER_SCALAR:          "mtp.blk.{bid}.layer_scalar",
+    MODEL_TENSOR.MTP_MASKED_EMB_CENTROIDS:      "mtp.masked_emb_centroids",
+    MODEL_TENSOR.MTP_MASKED_EMB_TOKEN_ORDERING: "mtp.masked_emb_token_ordering",
 }
 
 MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
@@ -2480,6 +2544,24 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.PER_LAYER_PROJ,
         MODEL_TENSOR.PER_LAYER_PROJ_NORM,
         MODEL_TENSOR.PER_LAYER_POST_NORM,
+        # Gemma4-style multi-block MTP overlay (drafter)
+        MODEL_TENSOR.MTP_PRE_PROJ,
+        MODEL_TENSOR.MTP_POST_PROJ,
+        MODEL_TENSOR.MTP_NORM,
+        MODEL_TENSOR.MTP_EMBED_TOKENS,
+        MODEL_TENSOR.MTP_ATTN_NORM,
+        MODEL_TENSOR.MTP_ATTN_POST_NORM,
+        MODEL_TENSOR.MTP_FFN_PRE_NORM,
+        MODEL_TENSOR.MTP_FFN_POST_NORM,
+        MODEL_TENSOR.MTP_ATTN_Q,
+        MODEL_TENSOR.MTP_ATTN_Q_NORM,
+        MODEL_TENSOR.MTP_ATTN_OUTPUT,
+        MODEL_TENSOR.MTP_FFN_GATE,
+        MODEL_TENSOR.MTP_FFN_UP,
+        MODEL_TENSOR.MTP_FFN_DOWN,
+        MODEL_TENSOR.MTP_LAYER_SCALAR,
+        MODEL_TENSOR.MTP_MASKED_EMB_CENTROIDS,
+        MODEL_TENSOR.MTP_MASKED_EMB_TOKEN_ORDERING,
     ],
     MODEL_ARCH.GEMMA_EMBEDDING: [
         MODEL_TENSOR.TOKEN_EMBD,

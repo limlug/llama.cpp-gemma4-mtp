@@ -94,6 +94,36 @@ struct llama_hparams {
 
     bool kv_only_nextn = false; // if true, only the last nextn_predict_layers blocks have a KV cache (MTP head arches)
 
+    // -- Gemma4-style multi-block MTP overlay --
+    //
+    // If `mtp_n_embd == 0`, MTP runs at the main `n_embd` (Qwen35 style).
+    // If `mtp_n_embd > 0`, the MTP graph is built as a sub-model at a
+    // different hidden size and consumes K/V cross-attention from the main
+    // model's last attention layers via runtime inputs.
+    uint32_t mtp_n_embd          = 0;
+    uint32_t mtp_n_ff            = 0;
+    uint32_t mtp_n_head          = 0;
+    uint32_t mtp_n_head_kv       = 0;
+    uint32_t mtp_n_embd_head_k   = 0;  // per-head dim for sliding-attention layers
+    uint32_t mtp_global_head_dim = 0;  // per-head dim for full-attention layer(s)
+    uint32_t mtp_sliding_window  = 0;
+    float    mtp_f_norm_rms_eps  = 1e-6f;
+
+    // Per-block layer type: 0 = sliding attention, 1 = full attention.
+    // Sized to the largest reasonable MTP block count.
+    std::array<uint8_t, LLAMA_MAX_LAYERS> mtp_layer_types{};
+
+    float    mtp_rope_full_theta          = 1e6f;
+    float    mtp_rope_sliding_theta       = 1e4f;
+    float    mtp_rope_full_partial_factor = 1.0f;
+
+    // Gemma4Assistant MaskedEmbedder (use_ordered_embeddings variants).
+    bool     mtp_use_ordered_embeddings = false;
+    uint32_t mtp_num_centroids          = 0;
+    uint32_t mtp_centroid_top_k         = 0;
+
+    bool     mtp_is_swa(uint32_t il) const { return mtp_layer_types[il] == 0; }
+
     float f_norm_eps;
     float f_norm_rms_eps;
     float f_norm_group_eps;

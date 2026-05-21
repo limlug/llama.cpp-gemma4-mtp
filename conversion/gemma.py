@@ -838,3 +838,180 @@ class Gemma4VisionAudioModel(MmprojModel):
                 data_torch = data_torch.permute(0, 3, 1, 2).contiguous()
             mapped_name = self.map_tensor_name(name, (".weight", ".bias", ".input_max", ".input_min", ".output_max", ".output_min"))
             yield (mapped_name, data_torch)
+
+
+@ModelBase.register("Gemma4AssistantForCausalLM")
+class Gemma4AssistantModel(TextModel):
+    """Drafter / Multi-Token-Prediction (MTP) overlay for Gemma4.
+
+    The model is shipped as an MTP-only GGUF that overlays a pre-existing
+    Gemma4 base GGUF. At runtime, the user passes both:
+        llama-server -m base.gguf --mtp-model gemma4-mtp.gguf
+
+    HF tensor catalog (48 total):
+        pre_projection.weight, post_projection.weight,
+        model.embed_tokens.weight, model.norm.weight,
+        model.layers.{0..3}.{input,post_attention,pre_feedforward,
+                              post_feedforward}_layernorm.weight,
+        model.layers.{0..3}.layer_scalar  (raw, no .weight suffix in HF),
+        model.layers.{0..3}.self_attn.{q_proj,q_norm,o_proj}.weight,
+        model.layers.{0..3}.mlp.{gate_proj,up_proj,down_proj}.weight.
+
+    Note: NO k_proj / v_proj — `attention_k_eq_v: true`. K and V are sourced
+    at runtime from the main model's last attention layers via the
+    `shared_kv_states` mechanism. See DESIGN_v2.md.
+    """
+
+    model_arch = gguf.MODEL_ARCH.GEMMA4
+
+    # This model is ONLY shipped as an MTP overlay.
+    no_mtp: bool = False
+    mtp_only: bool = True
+
+    _LAYER_TENSOR_REMAP = {
+        # HF suffix (after "model.layers.{bid}.")  ->  MODEL_TENSOR enum
+        "input_layernorm":            gguf.MODEL_TENSOR.MTP_ATTN_NORM,
+        "post_attention_layernorm":   gguf.MODEL_TENSOR.MTP_ATTN_POST_NORM,
+        "pre_feedforward_layernorm":  gguf.MODEL_TENSOR.MTP_FFN_PRE_NORM,
+        "post_feedforward_layernorm": gguf.MODEL_TENSOR.MTP_FFN_POST_NORM,
+        "self_attn.q_proj":           gguf.MODEL_TENSOR.MTP_ATTN_Q,
+        "self_attn.q_norm":           gguf.MODEL_TENSOR.MTP_ATTN_Q_NORM,
+        "self_attn.o_proj":           gguf.MODEL_TENSOR.MTP_ATTN_OUTPUT,
+        "mlp.gate_proj":              gguf.MODEL_TENSOR.MTP_FFN_GATE,
+        "mlp.up_proj":                gguf.MODEL_TENSOR.MTP_FFN_UP,
+        "mlp.down_proj":              gguf.MODEL_TENSOR.MTP_FFN_DOWN,
+        "layer_scalar":               gguf.MODEL_TENSOR.MTP_LAYER_SCALAR,
+    }
+
+    def set_vocab(self):
+        # Overlay shares the base model's tokenizer; no vocab carried.
+        logger.info("Gemma4Assistant: skipping vocab (loaded from base model)")
+
+    def set_gguf_parameters(self):
+        # DO NOT call super().set_gguf_parameters() — we don't want the base's
+        # trunk hparams (n_layer, n_embd, etc.) in the overlay; those come
+        # from the base GGUF at runtime.
+        #
+        # We DO emit the standard `general.architecture = "gemma4"` via the
+        # framework defaults, plus our new mtp.* keys.
+
+        # text_config has been flattened into self.hparams by TextModel.__init__.
+        # Source of truth for MTP dims:
+        n_predict     = int(self.hparams["num_hidden_layers"])         # 4
+        mtp_hidden    = int(self.hparams["hidden_size"])               # 1024
+        intermediate  = int(self.hparams["intermediate_size"])         # 8192
+        n_head        = int(self.hparams["num_attention_heads"])       # 32
+        n_head_kv     = int(self.hparams["num_key_value_heads"])       # 16
+        head_dim      = int(self.hparams["head_dim"])                  # 256
+        global_head_dim = int(self.hparams["global_head_dim"])         # 512
+        sliding_window  = int(self.hparams.get("sliding_window", 0))   # 1024
+        rms_eps         = float(self.hparams.get("rms_norm_eps", 1e-6))
+
+        self.gguf_writer.add_nextn_predict_layers(n_predict)
+        self.gguf_writer.add_mtp_hidden_size(mtp_hidden)
+        self.gguf_writer.add_mtp_intermediate_size(intermediate)
+        self.gguf_writer.add_mtp_head_count(n_head)
+        self.gguf_writer.add_mtp_head_count_kv(n_head_kv)
+        self.gguf_writer.add_mtp_head_dim(head_dim)
+        self.gguf_writer.add_mtp_global_head_dim(global_head_dim)
+        self.gguf_writer.add_mtp_sliding_window(sliding_window)
+        self.gguf_writer.add_mtp_layer_norm_eps(rms_eps)
+
+        # layer types: 0=sliding_attention, 1=full_attention
+        layer_type_codes = []
+        for t in self.hparams["layer_types"]:
+            if t == "sliding_attention":
+                layer_type_codes.append(0)
+            elif t == "full_attention":
+                layer_type_codes.append(1)
+            else:
+                raise ValueError(f"unknown layer type {t!r} in Gemma4Assistant text_config")
+        self.gguf_writer.add_mtp_layer_types(layer_type_codes)
+
+        # rope params
+        rope_params = self.hparams.get("rope_parameters") or {}
+        rope_full = rope_params.get("full_attention", {})
+        rope_swa  = rope_params.get("sliding_attention", {})
+        if rope_full:
+            self.gguf_writer.add_mtp_rope_full_theta_e6(int(float(rope_full.get("rope_theta", 1e6)) / 1e6))
+            self.gguf_writer.add_mtp_rope_full_partial_factor(float(rope_full.get("partial_rotary_factor", 1.0)))
+        if rope_swa:
+            self.gguf_writer.add_mtp_rope_sliding_theta_e3(int(float(rope_swa.get("rope_theta", 1e4)) / 1e3))
+
+        # Gemma4Assistant MaskedEmbedder (E2B uses this; 31B does not).
+        # TextModel.__init__ merges outer Gemma4AssistantConfig fields into
+        # self.hparams BEFORE overlaying text_config, so these top-level keys
+        # remain accessible (they don't collide with text_config).
+        use_ordered = bool(self.hparams.get("use_ordered_embeddings", False))
+        self.gguf_writer.add_mtp_use_ordered_embeddings(use_ordered)
+        if use_ordered:
+            self.gguf_writer.add_mtp_num_centroids(int(self.hparams["num_centroids"]))
+            self.gguf_writer.add_mtp_centroid_top_k(int(self.hparams["centroid_intermediate_top_k"]))
+
+    @classmethod
+    def filter_tensors(cls, item):
+        name, gen = item
+        # HF stores layer_scalar without a .weight suffix; align with the rest.
+        if name.endswith(".layer_scalar"):
+            name = name + ".weight"
+        return super().filter_tensors((name, gen))
+
+    def prepare_metadata(self, vocab_only: bool):
+        from_dir = self.fname_out.is_dir()
+        super().prepare_metadata(vocab_only=vocab_only)
+        if not from_dir:
+            return
+        # rename to mtp-*.gguf
+        output_type = self.ftype.name.partition("_")[2]
+        fname_default = gguf.naming_convention(
+            self.metadata.name, self.metadata.basename, self.metadata.finetune,
+            self.metadata.version, size_label=None, output_type=output_type, model_type=None,
+        )
+        self.fname_out = self.fname_out.parent / f"mtp-{fname_default}.gguf"
+
+    def modify_tensors(self, data_torch, name, bid):
+        # Top-level (unique) tensor names use TensorNameMap defaults via super().
+        if name in ("pre_projection.weight", "post_projection.weight"):
+            yield from super().modify_tensors(data_torch, name, bid)
+            return
+
+        # Disambiguate the colliding top-level names by formatting an explicit
+        # MTP_* canonical name (NOT going through TensorNameMap).
+        if name == "model.norm.weight":
+            new_name = self.format_tensor_name(gguf.MODEL_TENSOR.MTP_NORM)
+            yield (new_name, data_torch)
+            return
+        if name == "model.embed_tokens.weight":
+            new_name = self.format_tensor_name(gguf.MODEL_TENSOR.MTP_EMBED_TOKENS)
+            yield (new_name, data_torch)
+            return
+
+        # Per-layer tensors
+        if isinstance(bid, int) and name.startswith(f"model.layers.{bid}."):
+            suffix = name[len(f"model.layers.{bid}."):]
+            # strip ".weight" for the lookup
+            stem = suffix[:-len(".weight")] if suffix.endswith(".weight") else suffix
+            if stem in self._LAYER_TENSOR_REMAP:
+                enum = self._LAYER_TENSOR_REMAP[stem]
+                new_name = self.format_tensor_name(enum, bid)
+                yield (new_name, data_torch)
+                return
+
+        # Variants like gemma-4-E2B-it-assistant set use_ordered_embeddings=True
+        # which adds a masked_embedding submodule (Gemma4AssistantMaskedEmbedder
+        # with centroids + token_ordering). Keep these so the C++ side can
+        # reproduce HF's sparse centroid-based logits.
+        if name == "masked_embedding.centroids.weight":
+            new_name = self.format_tensor_name(gguf.MODEL_TENSOR.MTP_MASKED_EMB_CENTROIDS)
+            yield (new_name, data_torch)
+            return
+        if name == "masked_embedding.token_ordering":
+            # int64 buffer (one entry per vocab token, value in [0, vocab)).
+            # The framework already cast int64 → float32 in prepare_tensors;
+            # values fit losslessly in float32 (vocab=262144 < 2^24). C++ side
+            # reads as F32 and casts to int via floor/round before ggml_get_rows.
+            new_name = self.format_tensor_name(gguf.MODEL_TENSOR.MTP_MASKED_EMB_TOKEN_ORDERING)
+            yield (new_name, data_torch)
+            return
+
+        raise ValueError(f"Gemma4Assistant: unexpected tensor {name!r} (bid={bid})")

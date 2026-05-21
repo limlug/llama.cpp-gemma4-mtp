@@ -1293,6 +1293,44 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    // Apply user-supplied named-tensor bindings (e.g. Gemma4 MTP shared K/V).
+    // Currently only the four MTP shared-K/V slots are recognized — they're
+    // looked up directly via llm_graph_result slots (no graph walk needed).
+    // Bindings persist across decodes until cleared/overwritten.
+    if (!input_tensor_bindings.empty()) {
+        struct mapping {
+            const char  * name;
+            ggml_tensor * tensor;
+        };
+        const mapping known[] = {
+            { "mtp_shared_K_swa",  res->t_inp_mtp_shared_K_swa  },
+            { "mtp_shared_V_swa",  res->t_inp_mtp_shared_V_swa  },
+            { "mtp_shared_K_full", res->t_inp_mtp_shared_K_full },
+            { "mtp_shared_V_full", res->t_inp_mtp_shared_V_full },
+            { "mtp_h_input",       res->t_inp_mtp_h_input       },
+            { "mtp_attn_mask",     res->t_inp_mtp_attn_mask     },
+            { "mtp_const_one",     res->t_inp_mtp_const_one     },
+        };
+        for (const auto & [name, b] : input_tensor_bindings) {
+            ggml_tensor * t = nullptr;
+            for (const auto & m : known) {
+                if (name == m.name) { t = m.tensor; break; }
+            }
+            if (!t) {
+                LLAMA_LOG_WARN("%s: input_tensor binding '%s' is not a recognized binding name\n",
+                               __func__, name.c_str());
+                continue;
+            }
+            const size_t need = ggml_nbytes(t);
+            if (b.n_bytes != need) {
+                LLAMA_LOG_ERROR("%s: size mismatch for input tensor '%s': bound %zu B, expected %zu B\n",
+                                __func__, name.c_str(), b.n_bytes, need);
+                continue;
+            }
+            ggml_backend_tensor_set(t, b.data, 0, b.n_bytes);
+        }
+    }
+
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
@@ -1455,6 +1493,42 @@ int llama_context::encode(const llama_batch & batch_inp) {
         const uint32_t n_embd = hparams.n_embd;
         GGML_ASSERT(n_tokens*n_embd <= (int64_t) embd_pre_norm.size);
         ggml_backend_tensor_get_async(backend_h, t_h_pre_norm, embd_pre_norm.data, 0, n_tokens*n_embd*sizeof(float));
+    }
+
+    // Gemma4-style MTP: extract shared K/V from main-pass last attn layers.
+    // These are consumed by the MTP draft head's cross-attention. Each tensor
+    // is at shape [head_dim, n_head_kv, n_tokens] (per-ubatch slice). For the
+    // full-context K/V the drafter expects, the driver must accumulate across
+    // ubatches or read from the KV cache directly — see DESIGN_v2.md.
+    auto extract_shared = [&](ggml_tensor * t, std::vector<float> & buf, const char * label) {
+        if (!t) {
+            LLAMA_LOG_INFO("extract_shared(%s): t=NULL, skipping\n", label);
+            return;
+        }
+        ggml_backend_t be = ggml_backend_sched_get_tensor_backend(sched.get(), t);
+        if (!be) {
+            LLAMA_LOG_INFO("extract_shared(%s): t=%p but no backend (skipping)\n", label, (const void*)t);
+            return;
+        }
+        const size_t n_bytes = ggml_nbytes(t);
+        LLAMA_LOG_INFO("extract_shared(%s): t=%p, n_bytes=%zu, name='%s'\n",
+            label, (const void*)t, n_bytes, t->name);
+        if (buf.size() < n_bytes / sizeof(float)) {
+            buf.resize(n_bytes / sizeof(float));
+        }
+        ggml_backend_tensor_get_async(be, t, buf.data(), 0, n_bytes);
+    };
+    extract_shared(res->t_shared_K_swa,  shared_kv_K_swa,  "K_swa");
+    extract_shared(res->t_shared_V_swa,  shared_kv_V_swa,  "V_swa");
+    extract_shared(res->t_shared_K_full, shared_kv_K_full, "K_full");
+    extract_shared(res->t_shared_V_full, shared_kv_V_full, "V_full");
+    extract_shared(res->t_last_hidden_state, last_hidden_state, "last_hidden_state");
+    extract_shared(res->t_h_pre_norm,        h_pre_norm,        "h_pre_norm");
+
+    dbg_taps.clear();
+    for (auto & [label, t] : res->t_dbg) {
+        dbg_taps.emplace_back(label, std::vector<float>{});
+        extract_shared(t, dbg_taps.back().second, label.c_str());
     }
 
     // TODO: hacky solution
@@ -1908,6 +1982,81 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
                 GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_pre_norm.size);
                 ggml_backend_tensor_get_async(backend_h, t_h_pre_norm, embd_pre_norm_out, 0, n_rows*n_embd*sizeof(float));
+            }
+
+            // Gemma4-style MTP: extract shared K/V from main-pass last attn
+            // layers (decode path). See encoder path for description.
+            auto extract_shared_d = [&](ggml_tensor * t, std::vector<float> & buf, const char * label) {
+                if (!t) {
+                    LLAMA_LOG_INFO("extract_shared_d(%s): t=NULL, skipping\n", label);
+                    return;
+                }
+                ggml_backend_t be = ggml_backend_sched_get_tensor_backend(sched.get(), t);
+                if (!be) {
+                    LLAMA_LOG_INFO("extract_shared_d(%s): t=%p but no backend (skipping)\n", label, (const void*)t);
+                    return;
+                }
+                const size_t n_bytes = ggml_nbytes(t);
+                LLAMA_LOG_INFO("extract_shared_d(%s): t=%p, n_bytes=%zu, name='%s'\n",
+                    label, (const void*)t, n_bytes, t->name);
+                if (buf.size() < n_bytes / sizeof(float)) {
+                    buf.resize(n_bytes / sizeof(float));
+                }
+                ggml_backend_tensor_get_async(be, t, buf.data(), 0, n_bytes);
+            };
+            extract_shared_d(res->t_shared_K_swa,  shared_kv_K_swa,  "K_swa");
+            extract_shared_d(res->t_shared_V_swa,  shared_kv_V_swa,  "V_swa");
+            extract_shared_d(res->t_shared_K_full, shared_kv_K_full, "K_full");
+            extract_shared_d(res->t_shared_V_full, shared_kv_V_full, "V_full");
+            extract_shared_d(res->t_last_hidden_state, last_hidden_state, "last_hidden_state");
+            extract_shared_d(res->t_h_pre_norm,        h_pre_norm,        "h_pre_norm");
+
+            // Debug taps: extract every tap the model graph registered.
+            dbg_taps.clear();
+            for (auto & [label, t] : res->t_dbg) {
+                dbg_taps.emplace_back(label, std::vector<float>{});
+                extract_shared_d(t, dbg_taps.back().second, label.c_str());
+            }
+
+            // Gemma4 MTP masked_embedding: the graph emits plain lm_head as
+            // t_logits PLUS sparse (selected_logits, selected_indices). HF's
+            // drafter uses the sparse outputs scattered into a vocab tensor
+            // with mask_value=min(selected_logits)-1 at unselected positions.
+            // Reconstruct that here so llama_get_logits returns the masked
+            // logits and downstream sampling matches HF.
+            if (logits.data && n_outputs > 0 &&
+                model.arch == LLM_ARCH_GEMMA4 &&
+                model.hparams.mtp_use_ordered_embeddings)
+            {
+                const float * sl = nullptr;
+                const float * si = nullptr;
+                size_t sl_n = 0, si_n = 0;
+                for (const auto & [name, buf] : dbg_taps) {
+                    if (name == "selected_logits")  { sl = buf.data(); sl_n = buf.size(); }
+                    if (name == "selected_indices") { si = buf.data(); si_n = buf.size(); }
+                }
+                if (sl && si && sl_n > 0 && sl_n == si_n) {
+                    // Synchronize to ensure dbg_taps data is materialized.
+                    ggml_backend_sched_synchronize(sched.get());
+                    // Refresh pointers (vectors are stable for size-only growth, but be safe).
+                    for (const auto & [name, buf] : dbg_taps) {
+                        if (name == "selected_logits")  { sl = buf.data(); }
+                        if (name == "selected_indices") { si = buf.data(); }
+                    }
+                    float min_sl = sl[0];
+                    for (size_t k = 1; k < sl_n; ++k) min_sl = std::min(min_sl, sl[k]);
+                    const float mask_value = min_sl - 1.0f;
+                    float * logits_out = logits.data + n_outputs_prev*n_vocab;
+                    std::fill_n(logits_out, n_outputs * n_vocab, mask_value);
+                    // Sparse outputs apply to the last (only) MTP output row.
+                    const int64_t row = (n_outputs - 1) * n_vocab;
+                    for (size_t k = 0; k < sl_n; ++k) {
+                        const int64_t v = (int64_t) si[k];
+                        if (v >= 0 && v < (int64_t) n_vocab) {
+                            logits_out[row + v] = sl[k];
+                        }
+                    }
+                }
             }
         }
 
@@ -3069,6 +3218,18 @@ void llama_context::perf_reset() {
     n_reused    = 0;
 }
 
+bool llama_context::set_input_tensor(const char * name, const void * data, size_t n_bytes) {
+    if (!name || !data) {
+        return false;
+    }
+    input_tensor_bindings[name] = named_binding{ data, n_bytes };
+    return true;
+}
+
+void llama_context::clear_input_tensor_bindings() {
+    input_tensor_bindings.clear();
+}
+
 llama_memory_breakdown llama_context::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, llama_memory_breakdown_data> ret;
     for (const auto & [buft, size] : model.memory_breakdown()) {
@@ -3579,6 +3740,106 @@ float * llama_get_embeddings_pre_norm(llama_context * ctx) {
     ctx->synchronize();
 
     return ctx->get_embeddings_pre_norm();
+}
+
+// Gemma4-style MTP shared K/V accessors (see llama.h for semantics)
+const float * llama_get_shared_kv_K_swa(llama_context * ctx) {
+    ctx->synchronize();
+    return ctx->get_shared_kv_K_swa();
+}
+const float * llama_get_shared_kv_V_swa(llama_context * ctx) {
+    ctx->synchronize();
+    return ctx->get_shared_kv_V_swa();
+}
+const float * llama_get_shared_kv_K_full(llama_context * ctx) {
+    ctx->synchronize();
+    return ctx->get_shared_kv_K_full();
+}
+const float * llama_get_shared_kv_V_full(llama_context * ctx) {
+    ctx->synchronize();
+    return ctx->get_shared_kv_V_full();
+}
+size_t llama_get_shared_kv_swa_size(llama_context * ctx) {
+    ctx->synchronize();
+    return ctx->get_shared_kv_swa_size();
+}
+size_t llama_get_shared_kv_full_size(llama_context * ctx) {
+    ctx->synchronize();
+    return ctx->get_shared_kv_full_size();
+}
+
+const float * llama_context::get_last_hidden_state_ith(int32_t i) const {
+    if (last_hidden_state.empty()) return nullptr;
+    const uint32_t n_embd = model.hparams.n_embd;
+    if (n_embd == 0) return nullptr;
+    const size_t n_rows = last_hidden_state.size() / n_embd;
+    if (n_rows == 0) return nullptr;
+    int32_t row = i;
+    if (row < 0) row = (int32_t) n_rows + row;
+    if (row < 0 || (size_t) row >= n_rows) return nullptr;
+    return last_hidden_state.data() + (size_t) row * n_embd;
+}
+
+const float * llama_context::get_h_pre_norm_ith(int32_t i) const {
+    if (h_pre_norm.empty()) return nullptr;
+    const uint32_t n_embd = model.hparams.n_embd;
+    if (n_embd == 0) return nullptr;
+    const size_t n_rows = h_pre_norm.size() / n_embd;
+    if (n_rows == 0) return nullptr;
+    int32_t row = i;
+    if (row < 0) row = (int32_t) n_rows + row;
+    if (row < 0 || (size_t) row >= n_rows) return nullptr;
+    return h_pre_norm.data() + (size_t) row * n_embd;
+}
+
+const float * llama_get_last_hidden_state(llama_context * ctx) {
+    ctx->synchronize();
+    return ctx->get_last_hidden_state();
+}
+size_t llama_get_last_hidden_state_size(llama_context * ctx) {
+    ctx->synchronize();
+    return ctx->get_last_hidden_state_size();
+}
+const float * llama_get_last_hidden_state_ith(llama_context * ctx, int32_t i) {
+    ctx->synchronize();
+    return ctx->get_last_hidden_state_ith(i);
+}
+const float * llama_get_h_pre_norm(llama_context * ctx) {
+    ctx->synchronize();
+    return ctx->get_h_pre_norm();
+}
+const float * llama_get_h_pre_norm_ith(llama_context * ctx, int32_t i) {
+    ctx->synchronize();
+    return ctx->get_h_pre_norm_ith(i);
+}
+size_t llama_get_h_pre_norm_size(llama_context * ctx) {
+    ctx->synchronize();
+    return ctx->get_h_pre_norm_size();
+}
+
+int llama_get_dbg_tap_count(llama_context * ctx) {
+    ctx->synchronize();
+    return ctx->get_dbg_tap_count();
+}
+const char * llama_get_dbg_tap_name(llama_context * ctx, int i) {
+    ctx->synchronize();
+    return ctx->get_dbg_tap_name(i);
+}
+const float * llama_get_dbg_tap_data(llama_context * ctx, const char * name) {
+    ctx->synchronize();
+    return ctx->get_dbg_tap_data(name);
+}
+size_t llama_get_dbg_tap_size(llama_context * ctx, const char * name) {
+    ctx->synchronize();
+    return ctx->get_dbg_tap_size(name);
+}
+
+bool llama_set_input_tensor(llama_context * ctx, const char * name, const void * data, size_t n_bytes) {
+    return ctx->set_input_tensor(name, data, n_bytes);
+}
+
+void llama_clear_input_tensor_bindings(llama_context * ctx) {
+    ctx->clear_input_tensor_bindings();
 }
 
 float * llama_get_embeddings_pre_norm_ith(llama_context * ctx, int32_t i) {

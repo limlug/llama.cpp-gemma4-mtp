@@ -766,6 +766,28 @@ private:
             // TODO speculative: move to common/speculative.cpp?
             const auto & params_spec = params_base.speculative.draft;
 
+            if (llama_gguf_is_mtp_overlay(params_spec.mparams.path.c_str())) {
+                // Gemma4-style MTP overlay: attach to the target model in-place
+                // and reuse it for ctx_dft. No separate draft model load.
+                SRV_INF("attaching MTP overlay '%s' to target model (in-place)\n",
+                        params_spec.mparams.path.c_str());
+                int rc = llama_model_load_mtp_overlay(model_tgt, params_spec.mparams.path.c_str());
+                if (rc != 0) {
+                    SRV_ERR("failed to attach MTP overlay (rc=%d)\n", rc);
+                    return false;
+                }
+                auto cparams_mtp = common_context_params_to_llama(params_base);
+                cparams_mtp.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+                cparams_mtp.n_rs_seq = 0;
+                ctx_dft.reset(llama_init_from_model(model_tgt, cparams_mtp));
+                if (ctx_dft == nullptr) {
+                    SRV_ERR("%s", "failed to create MTP context\n");
+                    return false;
+                }
+                ctx_dft_seq_rm_type = common_context_can_seq_rm(ctx_dft.get());
+                params_base.speculative.draft.ctx_tgt = ctx_tgt;
+                params_base.speculative.draft.ctx_dft = ctx_dft.get();
+            } else {
             SRV_INF("loading draft model '%s'\n", params_spec.mparams.path.c_str());
 
             auto params_dft = params_base;
@@ -809,6 +831,7 @@ private:
 
             params_base.speculative.draft.ctx_tgt = ctx_tgt;
             params_base.speculative.draft.ctx_dft = ctx_dft.get();
+            }
         } else if (std::find(params_base.speculative.types.begin(), params_base.speculative.types.end(),
                              COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end()) {
             SRV_INF("creating MTP draft context against the target model '%s'\n",

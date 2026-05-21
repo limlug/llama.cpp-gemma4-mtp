@@ -18,6 +18,7 @@
 
 #include "ggml.h"
 #include "ggml-cpp.h"
+#include "gguf.h"
 
 #include <algorithm>
 #include <cassert>
@@ -2548,4 +2549,337 @@ void llama_model_base::create_tensor_qkv(llama_layer & layer, int bid,
         layer.wk_b = create_tensor(tn(LLM_TENSOR_ATTN_K, "bias", bid), {n_embd_k_}, TENSOR_NOT_REQUIRED);
         layer.wv_b = create_tensor(tn(LLM_TENSOR_ATTN_V, "bias", bid), {n_embd_v_}, TENSOR_NOT_REQUIRED);
     }
+}
+
+// =========================================================================
+// llama_model_load_mtp_overlay — attach an MTP overlay GGUF to a base model.
+//
+// Opens the overlay GGUF, validates it is a Gemma4 MTP overlay compatible
+// with the base model, reads MTP-specific hparams into model->hparams, and
+// loads all MTP tensors into model->mtp.* via a ggml_context owned by
+// model->mtp.overlay_ctx (CPU-resident; the backend scheduler handles any
+// cross-backend copies at compute time).
+//
+// Returns 0 on success, negative on specific validation failures.
+// Repeated calls overwrite the previous overlay.
+// =========================================================================
+bool llama_gguf_is_mtp_overlay(const char * path) {
+    if (!path) return false;
+    struct gguf_init_params iparams = {};
+    iparams.no_alloc = true;
+    iparams.ctx      = nullptr;
+    gguf_context * gguf = gguf_init_from_file(path, iparams);
+    if (!gguf) return false;
+    // Read arch first; we only care for arches that ship overlays.
+    int64_t arch_id = gguf_find_key(gguf, "general.architecture");
+    std::string arch;
+    if (arch_id >= 0 && gguf_get_kv_type(gguf, arch_id) == GGUF_TYPE_STRING) {
+        arch = gguf_get_val_str(gguf, arch_id);
+    }
+    // Overlay marker: has "{arch}.mtp.hidden_size" AND lacks "{arch}.context_length".
+    bool has_mtp_hidden = false;
+    bool has_context_length = false;
+    if (!arch.empty()) {
+        const std::string k_mtp = arch + ".mtp.hidden_size";
+        const std::string k_ctx = arch + ".context_length";
+        has_mtp_hidden     = gguf_find_key(gguf, k_mtp.c_str()) >= 0;
+        has_context_length = gguf_find_key(gguf, k_ctx.c_str()) >= 0;
+    }
+    gguf_free(gguf);
+    return has_mtp_hidden && !has_context_length;
+}
+
+int32_t llama_model_load_mtp_overlay(llama_model * model, const char * path) {
+    if (!model)   { LLAMA_LOG_ERROR("%s: model is NULL\n", __func__); return -1; }
+    if (!path)    { LLAMA_LOG_ERROR("%s: path is NULL\n", __func__);  return -2; }
+
+    if (model->arch != LLM_ARCH_GEMMA4) {
+        LLAMA_LOG_ERROR("%s: base model arch is not gemma4 (current: %s)\n",
+                        __func__, llm_arch_name(model->arch));
+        return -3;
+    }
+
+    // Open the overlay GGUF with eager allocation: ggml_context holds all
+    // tensor data after this call. We transfer ownership of the context to
+    // model->mtp.overlay_ctx on success.
+    struct ggml_context * overlay_ggml = nullptr;
+    struct gguf_init_params iparams = {};
+    iparams.no_alloc = false;
+    iparams.ctx      = &overlay_ggml;
+
+    gguf_context * gguf = gguf_init_from_file(path, iparams);
+    if (!gguf || !overlay_ggml) {
+        LLAMA_LOG_ERROR("%s: failed to open overlay GGUF: %s\n", __func__, path);
+        if (overlay_ggml) ggml_free(overlay_ggml);
+        if (gguf)         gguf_free(gguf);
+        return -4;
+    }
+    // RAII for gguf (free unconditionally) and ggml context (free only on
+    // failure — on success we transfer to model->mtp.overlay_ctx).
+    struct gguf_free_t { gguf_context * g; ~gguf_free_t() { gguf_free(g); } } gff{ gguf };
+    bool keep_overlay_ggml = false;
+    struct ggml_free_t {
+        ggml_context * c;
+        bool         * keep;
+        ~ggml_free_t() { if (c && !*keep) ggml_free(c); }
+    } gff_ggml{ overlay_ggml, &keep_overlay_ggml };
+
+    // 1) Arch check
+    {
+        int64_t id = gguf_find_key(gguf, "general.architecture");
+        if (id < 0 || gguf_get_kv_type(gguf, id) != GGUF_TYPE_STRING) {
+            LLAMA_LOG_ERROR("%s: overlay missing general.architecture\n", __func__);
+            return -5;
+        }
+        const char * arch = gguf_get_val_str(gguf, id);
+        if (std::string(arch) != "gemma4") {
+            LLAMA_LOG_ERROR("%s: overlay arch '%s' != 'gemma4'\n", __func__, arch);
+            return -6;
+        }
+    }
+
+    // 2) Required MTP metadata
+    auto get_u32 = [&](const char * key, uint32_t * out) -> bool {
+        int64_t id = gguf_find_key(gguf, key);
+        if (id < 0 || gguf_get_kv_type(gguf, id) != GGUF_TYPE_UINT32) return false;
+        *out = gguf_get_val_u32(gguf, id);
+        return true;
+    };
+    auto get_f32 = [&](const char * key, float * out) -> bool {
+        int64_t id = gguf_find_key(gguf, key);
+        if (id < 0 || gguf_get_kv_type(gguf, id) != GGUF_TYPE_FLOAT32) return false;
+        *out = gguf_get_val_f32(gguf, id);
+        return true;
+    };
+
+    uint32_t n_predict = 0, mtp_hidden = 0, mtp_ff = 0, mtp_head = 0;
+    uint32_t mtp_head_kv = 0, mtp_head_dim = 0, mtp_global_head_dim = 0;
+    uint32_t mtp_sw = 0;
+    float mtp_eps = 1e-6f;
+
+    if (!get_u32("gemma4.nextn_predict_layers", &n_predict)   ||
+        !get_u32("gemma4.mtp.hidden_size",       &mtp_hidden) ||
+        !get_u32("gemma4.mtp.intermediate_size", &mtp_ff)     ||
+        !get_u32("gemma4.mtp.attention.head_count",       &mtp_head)     ||
+        !get_u32("gemma4.mtp.attention.head_count_kv",    &mtp_head_kv)  ||
+        !get_u32("gemma4.mtp.attention.head_dim",         &mtp_head_dim) ||
+        !get_u32("gemma4.mtp.attention.global_head_dim",  &mtp_global_head_dim))
+    {
+        LLAMA_LOG_ERROR("%s: overlay missing required mtp.* metadata\n", __func__);
+        return -7;
+    }
+    get_u32("gemma4.mtp.attention.sliding_window", &mtp_sw);
+    get_f32("gemma4.mtp.attention.layer_norm_rms_epsilon", &mtp_eps);
+
+    // 3) Compat check: pre_proj output dim must equal base n_embd.
+    //    pre_proj tensor shape on disk: [2*backbone, mtp_hidden] → file-side
+    //    columns of pre_proj are backbone_dim; we infer backbone from the
+    //    tensor's ne[0] (= 2*backbone) and assert.
+    {
+        int64_t tid = gguf_find_tensor(gguf, "mtp.pre_proj.weight");
+        if (tid < 0) {
+            LLAMA_LOG_ERROR("%s: overlay missing mtp.pre_proj.weight\n", __func__);
+            return -8;
+        }
+        // gguf doesn't expose tensor shape per-dim through this API; the size
+        // check below is a coarse proxy for shape compatibility.
+        const size_t bytes = gguf_get_tensor_size(gguf, tid);
+        const size_t expected = (size_t) 2 * model->hparams.n_embd * mtp_hidden *
+                                ggml_type_size(gguf_get_tensor_type(gguf, tid));
+        if (bytes != expected) {
+            LLAMA_LOG_ERROR("%s: overlay incompatible: mtp.pre_proj.weight is %zu bytes, "
+                            "expected %zu (2*base.n_embd=%u, mtp.hidden_size=%u)\n",
+                            __func__, bytes, expected, 2*model->hparams.n_embd, mtp_hidden);
+            return -9;
+        }
+    }
+
+    // 4) Stash MTP hparams onto the base model
+    auto & hp = model->hparams;
+    hp.nextn_predict_layers = n_predict;
+    hp.mtp_n_embd          = mtp_hidden;
+    hp.mtp_n_ff            = mtp_ff;
+    hp.mtp_n_head          = mtp_head;
+    hp.mtp_n_head_kv       = mtp_head_kv;
+    hp.mtp_n_embd_head_k   = mtp_head_dim;
+    hp.mtp_global_head_dim = mtp_global_head_dim;
+    hp.mtp_sliding_window  = mtp_sw;
+    hp.mtp_f_norm_rms_eps  = mtp_eps;
+
+    // layer_types array
+    int64_t lt_id = gguf_find_key(gguf, "gemma4.mtp.layer_types");
+    if (lt_id < 0 || gguf_get_kv_type(gguf, lt_id) != GGUF_TYPE_ARRAY) {
+        LLAMA_LOG_ERROR("%s: overlay missing gemma4.mtp.layer_types\n", __func__);
+        return -10;
+    }
+    {
+        const size_t n = gguf_get_arr_n(gguf, lt_id);
+        if (n != n_predict) {
+            LLAMA_LOG_ERROR("%s: overlay layer_types size %zu != nextn_predict_layers %u\n",
+                            __func__, n, n_predict);
+            return -11;
+        }
+        const int32_t * data = (const int32_t *) gguf_get_arr_data(gguf, lt_id);
+        for (size_t i = 0; i < n; ++i) {
+            hp.mtp_layer_types[i] = (uint8_t) data[i];
+        }
+    }
+
+    // rope params (optional)
+    uint32_t rope_full_e6 = 0, rope_swa_e3 = 0;
+    get_u32("gemma4.mtp.rope.full.theta_e6",    &rope_full_e6);
+    get_u32("gemma4.mtp.rope.sliding.theta_e3", &rope_swa_e3);
+    if (rope_full_e6 > 0) hp.mtp_rope_full_theta    = (float) rope_full_e6 * 1e6f;
+    if (rope_swa_e3  > 0) hp.mtp_rope_sliding_theta = (float) rope_swa_e3  * 1e3f;
+    get_f32("gemma4.mtp.rope.full.partial_rotary_factor", &hp.mtp_rope_full_partial_factor);
+
+    // MaskedEmbedder metadata (optional; defaults to disabled).
+    {
+        int64_t id = gguf_find_key(gguf, "gemma4.mtp.use_ordered_embeddings");
+        if (id >= 0 && gguf_get_kv_type(gguf, id) == GGUF_TYPE_BOOL) {
+            hp.mtp_use_ordered_embeddings = gguf_get_val_bool(gguf, id);
+        }
+    }
+    get_u32("gemma4.mtp.num_centroids",                &hp.mtp_num_centroids);
+    get_u32("gemma4.mtp.centroid_intermediate_top_k",  &hp.mtp_centroid_top_k);
+
+    LLAMA_LOG_INFO("%s: overlay validated and hparams loaded:\n", __func__);
+    LLAMA_LOG_INFO("%s:   predict_layers = %u\n",            __func__, n_predict);
+    LLAMA_LOG_INFO("%s:   mtp_hidden     = %u\n",            __func__, mtp_hidden);
+    LLAMA_LOG_INFO("%s:   mtp_n_ff       = %u\n",            __func__, mtp_ff);
+    LLAMA_LOG_INFO("%s:   mtp_n_head     = %u (kv=%u)\n",    __func__, mtp_head, mtp_head_kv);
+    LLAMA_LOG_INFO("%s:   head_dim swa/full = %u/%u\n",      __func__, mtp_head_dim, mtp_global_head_dim);
+
+    // ----- Tensor copy into model->mtp.* -----
+    //
+    // gguf_init_from_file with no_alloc=false has already loaded every tensor
+    // into overlay_ggml's CPU buffer. We just need to:
+    //   1. Look up each expected tensor by name
+    //   2. Validate its shape against the hparams
+    //   3. Assign its ggml_tensor pointer to the matching model->mtp.* field
+    //
+    // The ggml_context lifetime is transferred to model->mtp.overlay_ctx so
+    // the tensors stay alive for the model's lifetime.
+    auto & mtp = model->mtp;
+    mtp.layers.clear();
+    mtp.layers.resize(n_predict);
+
+    auto lookup = [&](const char * name, std::initializer_list<int64_t> expected_shape,
+                      ggml_type expected_type) -> ggml_tensor * {
+        ggml_tensor * t = ggml_get_tensor(overlay_ggml, name);
+        if (!t) {
+            LLAMA_LOG_ERROR("%s: overlay missing tensor '%s'\n", __func__, name);
+            return nullptr;
+        }
+        if (t->type != expected_type) {
+            LLAMA_LOG_ERROR("%s: tensor '%s' has type %s, expected %s\n",
+                            __func__, name, ggml_type_name(t->type), ggml_type_name(expected_type));
+            return nullptr;
+        }
+        // Validate shape (ne dims, in order).
+        const int n_dims_exp = (int) expected_shape.size();
+        if (ggml_n_dims(t) != n_dims_exp) {
+            LLAMA_LOG_ERROR("%s: tensor '%s' has %d dims, expected %d\n",
+                            __func__, name, ggml_n_dims(t), n_dims_exp);
+            return nullptr;
+        }
+        auto it = expected_shape.begin();
+        for (int d = 0; d < n_dims_exp; ++d, ++it) {
+            if (t->ne[d] != *it) {
+                LLAMA_LOG_ERROR("%s: tensor '%s' dim %d is %lld, expected %lld\n",
+                                __func__, name, d, (long long) t->ne[d], (long long) *it);
+                return nullptr;
+            }
+        }
+        return t;
+    };
+
+    // Tensors in the GGUF have F16/F32 type (per the validator we wrote earlier).
+    const int64_t backbone = (int64_t) model->hparams.n_embd;
+    const int64_t mh       = mtp_hidden;
+    const int64_t ff       = mtp_ff;
+    const int64_t n_vocab  = (int64_t) model->vocab.n_tokens();
+
+    // Top-level tensors
+    mtp.pre_proj     = lookup("mtp.pre_proj.weight",     {2 * backbone, mh}, GGML_TYPE_F16);
+    mtp.post_proj    = lookup("mtp.post_proj.weight",    {mh, backbone},     GGML_TYPE_F16);
+    mtp.norm         = lookup("mtp.norm.weight",         {mh},               GGML_TYPE_F32);
+    mtp.embed_tokens = lookup("mtp.embed_tokens.weight", {mh, n_vocab},      GGML_TYPE_F16);
+    if (!mtp.pre_proj || !mtp.post_proj || !mtp.norm || !mtp.embed_tokens) {
+        mtp = {};  // reset partial state
+        return -12;
+    }
+
+    char name_buf[128];
+    bool layer_ok = true;
+    for (uint32_t il = 0; il < n_predict; ++il) {
+        auto & L = mtp.layers[il];
+        const bool is_swa = (model->hparams.mtp_layer_types[il] == 0);
+
+        const int64_t head_dim = is_swa ? (int64_t) mtp_head_dim
+                                        : (int64_t) mtp_global_head_dim;
+        const int64_t q_dim    = head_dim * (int64_t) mtp_head;
+
+        auto get = [&](const char * suffix, std::initializer_list<int64_t> shape, ggml_type ty) -> ggml_tensor * {
+            std::snprintf(name_buf, sizeof(name_buf), "mtp.blk.%u.%s.weight", il, suffix);
+            ggml_tensor * t = lookup(name_buf, shape, ty);
+            if (!t) layer_ok = false;
+            return t;
+        };
+
+        L.attn_norm      = get("attn_norm",      {mh},   GGML_TYPE_F32);
+        L.attn_post_norm = get("attn_post_norm", {mh},   GGML_TYPE_F32);
+        L.ffn_pre_norm   = get("ffn_pre_norm",   {mh},   GGML_TYPE_F32);
+        L.ffn_post_norm  = get("ffn_post_norm",  {mh},   GGML_TYPE_F32);
+
+        L.wq             = get("attn_q",         {mh, q_dim}, GGML_TYPE_F16);
+        L.attn_q_norm    = get("attn_q_norm",    {head_dim},  GGML_TYPE_F32);
+        L.wo             = get("attn_output",    {q_dim, mh}, GGML_TYPE_F16);
+
+        L.ffn_gate       = get("ffn_gate",       {mh, ff},    GGML_TYPE_F16);
+        L.ffn_up         = get("ffn_up",         {mh, ff},    GGML_TYPE_F16);
+        L.ffn_down       = get("ffn_down",       {ff, mh},    GGML_TYPE_F16);
+
+        // layer_scalar is optional in the checkpoint
+        std::snprintf(name_buf, sizeof(name_buf), "mtp.blk.%u.layer_scalar.weight", il);
+        L.out_scale = ggml_get_tensor(overlay_ggml, name_buf);
+        if (L.out_scale) {
+            if (L.out_scale->type != GGML_TYPE_F32 || L.out_scale->ne[0] != 1) {
+                LLAMA_LOG_ERROR("%s: tensor '%s' has unexpected shape/type\n", __func__, name_buf);
+                layer_ok = false;
+            }
+        }
+    }
+
+    if (!layer_ok) {
+        mtp = {};  // reset partial state
+        return -13;
+    }
+
+    // MaskedEmbedder tensors (optional — present only when use_ordered_embeddings).
+    if (hp.mtp_use_ordered_embeddings) {
+        const int64_t nc = (int64_t) hp.mtp_num_centroids;
+        mtp.masked_emb_centroids = lookup("mtp.masked_emb_centroids.weight",
+                                          {mh, nc}, GGML_TYPE_F16);
+        mtp.masked_emb_token_ordering = lookup("mtp.masked_emb_token_ordering.weight",
+                                               {n_vocab}, GGML_TYPE_F32);
+        if (!mtp.masked_emb_centroids || !mtp.masked_emb_token_ordering) {
+            LLAMA_LOG_ERROR("%s: use_ordered_embeddings=true but masked_emb_* missing\n",
+                            __func__);
+            mtp = {};
+            return -14;
+        }
+        LLAMA_LOG_INFO("%s: masked_embedding: num_centroids=%u top_k=%u\n",
+                       __func__, hp.mtp_num_centroids, hp.mtp_centroid_top_k);
+    }
+
+    // Transfer ggml context ownership to the model. The gguf context is freed
+    // by the RAII helper at scope exit; the ggml context is kept alive via
+    // model->mtp.overlay_ctx.
+    mtp.overlay_ctx.reset(overlay_ggml);
+    keep_overlay_ggml = true;
+
+    LLAMA_LOG_INFO("%s: overlay attached: 4 top-level + %u * 11 per-block tensors loaded\n",
+                   __func__, n_predict);
+    return 0;
 }

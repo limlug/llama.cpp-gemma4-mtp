@@ -11,6 +11,8 @@
 #include <set>
 #include <functional>
 #include <map>
+#include <string>
+#include <utility>
 
 struct ggml_cgraph;
 struct ggml_context;
@@ -647,6 +649,13 @@ public:
     ggml_tensor * get_embd()        const { return t_embd; }
     ggml_tensor * get_embd_pooled() const { return t_embd_pooled; }
     ggml_tensor * get_h_pre_norm()  const { return t_h_pre_norm; }
+    ggml_tensor * get_last_hidden_state() const { return t_last_hidden_state; }
+
+    // Gemma4-style MTP shared K/V (captured from main pass last attn layers)
+    ggml_tensor * get_shared_K_swa()  const { return t_shared_K_swa; }
+    ggml_tensor * get_shared_V_swa()  const { return t_shared_V_swa; }
+    ggml_tensor * get_shared_K_full() const { return t_shared_K_full; }
+    ggml_tensor * get_shared_V_full() const { return t_shared_V_full; }
 
     ggml_cgraph  * get_gf()  const { return gf; }
     ggml_context * get_ctx() const { return ctx_compute.get(); }
@@ -676,6 +685,39 @@ public:
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
     ggml_tensor * t_h_pre_norm  = nullptr; // [n_embd, n_outputs] hidden state before final output norm
+
+    // Gemma4-style MTP: last post-norm hidden state of the BASE model's main
+    // pass. Captured once per ubatch as the "h" input the drafter consumes
+    // via mtp_h_input. Distinct from t_embd (which depends on cparams).
+    ggml_tensor * t_last_hidden_state = nullptr;
+
+    // Gemma4-style MTP: K and V tensors from the main model's LAST attention
+    // layer of each type, captured per ubatch. Consumed by graph_mtp via
+    // runtime input binding for cross-attention. NULL for arches that don't
+    // ship a Gemma4-style MTP overlay.
+    ggml_tensor * t_shared_K_swa  = nullptr;
+    ggml_tensor * t_shared_V_swa  = nullptr;
+    ggml_tensor * t_shared_K_full = nullptr;
+    ggml_tensor * t_shared_V_full = nullptr;
+
+    // Gemma4-style MTP: the INPUT-side tensors declared inside graph_mtp that
+    // the driver writes K/V data into before each MTP forward step. Distinct
+    // from t_shared_* above (which are MAIN-pass capture sites). Stored here
+    // so the context's set_input_tensor() path can find them without a graph
+    // walk by name.
+    ggml_tensor * t_inp_mtp_shared_K_swa  = nullptr;
+    ggml_tensor * t_inp_mtp_shared_V_swa  = nullptr;
+    ggml_tensor * t_inp_mtp_shared_K_full = nullptr;
+    ggml_tensor * t_inp_mtp_shared_V_full = nullptr;
+    ggml_tensor * t_inp_mtp_h_input       = nullptr;
+    ggml_tensor * t_inp_mtp_attn_mask     = nullptr;
+    ggml_tensor * t_inp_mtp_const_one     = nullptr;  // scalar 1.0 (for mask_value calc)
+
+    // Optional debug taps. The model graph emplaces (label, tensor) pairs here
+    // for the context to extract after forward. Used by
+    // test-gemma4-mtp-ref-diff to compare against HF reference activations.
+    // Labels are HF-equivalent (e.g. "pre_projection", "L0.q_proj").
+    std::vector<std::pair<std::string, ggml_tensor*>> t_dbg;
 
     std::map<llama_seq_id, ggml_tensor*> t_sampled_logits;
     std::map<llama_seq_id, ggml_tensor*> t_candidates;

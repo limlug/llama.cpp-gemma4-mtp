@@ -11,6 +11,7 @@
 #include "ggml-opt.h"
 
 #include <map>
+#include <unordered_map>
 #include <vector>
 
 struct llama_model;
@@ -86,6 +87,53 @@ struct llama_context {
 
     float * get_embeddings_pre_norm();
     float * get_embeddings_pre_norm_ith(int32_t i);
+
+    // Gemma4-style MTP shared K/V accessors (see llama.h for semantics)
+    const float * get_shared_kv_K_swa()  const { return shared_kv_K_swa.empty()  ? nullptr : shared_kv_K_swa.data();  }
+    const float * get_shared_kv_V_swa()  const { return shared_kv_V_swa.empty()  ? nullptr : shared_kv_V_swa.data();  }
+    const float * get_shared_kv_K_full() const { return shared_kv_K_full.empty() ? nullptr : shared_kv_K_full.data(); }
+    const float * get_shared_kv_V_full() const { return shared_kv_V_full.empty() ? nullptr : shared_kv_V_full.data(); }
+    size_t        get_shared_kv_swa_size()  const { return shared_kv_K_swa.size();  }
+    size_t        get_shared_kv_full_size() const { return shared_kv_K_full.size(); }
+
+    // Gemma4-style MTP: base model's last post-norm hidden state captured per
+    // ubatch (consumed by the drafter via mtp_h_input). Captured on ctx_tgt.
+    const float * get_last_hidden_state() const { return last_hidden_state.empty() ? nullptr : last_hidden_state.data(); }
+    size_t        get_last_hidden_state_size() const { return last_hidden_state.size(); }
+    // Per-token slice of last_hidden_state. The capture buffer holds
+    // [n_embd * n_tokens] floats; this returns the i-th token's row. i==-1
+    // means the LAST row. Returns nullptr if no capture or out-of-range.
+    const float * get_last_hidden_state_ith(int32_t i) const;
+
+    // Gemma4-style MTP: drafter's post-projection output (h_next) from the
+    // last MTP decode — to be fed back as mtp_h_input on the next MTP step.
+    // Captured on ctx_dft.
+    const float * get_h_pre_norm() const { return h_pre_norm.empty() ? nullptr : h_pre_norm.data(); }
+    size_t        get_h_pre_norm_size() const { return h_pre_norm.size(); }
+    const float * get_h_pre_norm_ith(int32_t i) const;
+
+    // Debug-tap accessors (see llama.h).
+    int           get_dbg_tap_count() const { return (int) dbg_taps.size(); }
+    const char *  get_dbg_tap_name(int i) const {
+        return (i >= 0 && (size_t) i < dbg_taps.size()) ? dbg_taps[i].first.c_str() : nullptr;
+    }
+    const float * get_dbg_tap_data(const char * name) const {
+        for (const auto & [n, v] : dbg_taps) if (n == name) return v.empty() ? nullptr : v.data();
+        return nullptr;
+    }
+    size_t get_dbg_tap_size(const char * name) const {
+        for (const auto & [n, v] : dbg_taps) if (n == name) return v.size();
+        return 0;
+    }
+
+    // Bind data into a named ggml input tensor of the upcoming decode's graph.
+    // The binding is applied once after the standard set_inputs() and before
+    // forward. Useful for arches with externally-supplied inputs (e.g. Gemma4
+    // MTP's shared K/V from the main pass). The binding stays in effect across
+    // multiple decodes until cleared or overwritten by another bind with the
+    // same name. Returns false if data is NULL.
+    bool set_input_tensor(const char * name, const void * data, size_t n_bytes);
+    void clear_input_tensor_bindings();
 
     llama_token * get_sampled_tokens() const;
     llama_token   get_sampled_token_ith(int32_t idx);
@@ -286,6 +334,39 @@ private:
     // populated only when cparams.embeddings_pre_norm is enabled and the model graph
     // sets llm_graph_result::t_h_pre_norm
     buffer_view<float> embd_pre_norm = {nullptr, 0};
+
+    // Gemma4-style MTP shared K/V — captured once per main-pass ubatch from the
+    // last sliding and last full attention layers. The MTP draft head reads
+    // these to do cross-attention. Empty for arches that don't ship MTP.
+    // Stored as host-side vectors (separate from buf_output) for simplicity;
+    // they're only written/read per ubatch via ggml_backend_tensor_get_async
+    // and consumed by the MTP draft pass.
+    std::vector<float> shared_kv_K_swa;
+    std::vector<float> shared_kv_V_swa;
+    std::vector<float> shared_kv_K_full;
+    std::vector<float> shared_kv_V_full;
+
+    // Gemma4-style MTP h_input plumbing. last_hidden_state is filled by the
+    // base ctx_tgt main-pass capture; h_pre_norm is filled by the drafter
+    // ctx_dft after each MTP decode. Both flow into mtp_h_input on subsequent
+    // decodes via llama_set_input_tensor("mtp_h_input", ...).
+    std::vector<float> last_hidden_state;
+    std::vector<float> h_pre_norm;
+
+    // Debug taps captured per-ubatch from the model graph. Keyed by HF-
+    // equivalent label (e.g. "pre_projection", "L0.q_proj"). Empty unless
+    // the model graph emplaces taps into res->t_dbg.
+    std::vector<std::pair<std::string, std::vector<float>>> dbg_taps;
+
+    // External named tensor bindings (data pointers + sizes, applied after
+    // set_inputs and before forward). Used to feed externally-supplied
+    // inputs like Gemma4 MTP shared K/V. The map holds borrowed pointers —
+    // the caller must keep the source alive across decodes.
+    struct named_binding {
+        const void * data = nullptr;
+        size_t n_bytes = 0;
+    };
+    std::unordered_map<std::string, named_binding> input_tensor_bindings;
 
     struct sampling_info {
         // !samplers.empty() to check if any samplers are active

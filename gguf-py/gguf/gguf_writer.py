@@ -868,6 +868,54 @@ class GGUFWriter:
     def add_nextn_predict_layers(self, count: int) -> None:
         self.add_uint32(Keys.LLM.NEXTN_PREDICT_LAYERS.format(arch=self.arch), count)
 
+    # -- Gemma4-style multi-block MTP overlay --
+
+    def add_mtp_hidden_size(self, value: int) -> None:
+        self.add_uint32(Keys.MTP.HIDDEN_SIZE.format(arch=self.arch), value)
+
+    def add_mtp_intermediate_size(self, value: int) -> None:
+        self.add_uint32(Keys.MTP.INTERMEDIATE_SIZE.format(arch=self.arch), value)
+
+    def add_mtp_head_count(self, value: int) -> None:
+        self.add_uint32(Keys.MTP.N_HEAD.format(arch=self.arch), value)
+
+    def add_mtp_head_count_kv(self, value: int) -> None:
+        self.add_uint32(Keys.MTP.N_HEAD_KV.format(arch=self.arch), value)
+
+    def add_mtp_head_dim(self, value: int) -> None:
+        self.add_uint32(Keys.MTP.HEAD_DIM.format(arch=self.arch), value)
+
+    def add_mtp_global_head_dim(self, value: int) -> None:
+        self.add_uint32(Keys.MTP.GLOBAL_HEAD_DIM.format(arch=self.arch), value)
+
+    def add_mtp_sliding_window(self, value: int) -> None:
+        self.add_uint32(Keys.MTP.SLIDING_WINDOW.format(arch=self.arch), value)
+
+    def add_mtp_layer_norm_eps(self, value: float) -> None:
+        self.add_float32(Keys.MTP.LAYER_NORM_EPS.format(arch=self.arch), value)
+
+    def add_mtp_layer_types(self, values: Sequence[int]) -> None:
+        """Each entry: 0 = sliding_attention, 1 = full_attention."""
+        self.add_array(Keys.MTP.LAYER_TYPES.format(arch=self.arch), list(values))
+
+    def add_mtp_rope_full_theta_e6(self, value: int) -> None:
+        self.add_uint32(Keys.MTP.ROPE_FULL_THETA_E6.format(arch=self.arch), value)
+
+    def add_mtp_rope_sliding_theta_e3(self, value: int) -> None:
+        self.add_uint32(Keys.MTP.ROPE_SLIDING_THETA_E3.format(arch=self.arch), value)
+
+    def add_mtp_rope_full_partial_factor(self, value: float) -> None:
+        self.add_float32(Keys.MTP.ROPE_FULL_PARTIAL_FACTOR.format(arch=self.arch), value)
+
+    def add_mtp_use_ordered_embeddings(self, value: bool) -> None:
+        self.add_bool(Keys.MTP.USE_ORDERED_EMBEDDINGS.format(arch=self.arch), value)
+
+    def add_mtp_num_centroids(self, value: int) -> None:
+        self.add_uint32(Keys.MTP.NUM_CENTROIDS.format(arch=self.arch), value)
+
+    def add_mtp_centroid_top_k(self, value: int) -> None:
+        self.add_uint32(Keys.MTP.CENTROID_TOP_K.format(arch=self.arch), value)
+
     def add_swin_norm(self, value: bool) -> None:
         self.add_bool(Keys.LLM.SWIN_NORM.format(arch=self.arch), value)
 

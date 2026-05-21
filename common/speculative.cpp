@@ -1,5 +1,7 @@
 #include "speculative.h"
 
+#include <limits>
+
 #include "common.h"
 #include "ggml.h"
 #include "llama.h"
@@ -434,6 +436,31 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     // pre-advancement before process() mirrored the verify batch.
     std::vector<uint16_t> last_n_drafted;
 
+    // Persistent backing buffer for the mtp_attn_mask binding. MUST outlive
+    // every llama_decode that uses the binding (see llama_set_input_tensor
+    // lifetime hazard). Resized per-decode (n_ctx × batch.n_tokens).
+    std::vector<float> mtp_attn_mask_buf;
+    int64_t mtp_kv_len = 0;  // valid K positions, set by process() before each decode
+
+    // Helper: rebind mtp_attn_mask to size n_ctx * n_batch_tokens, valid
+    // positions [0..mtp_kv_len), -inf elsewhere. Must be called before EVERY
+    // llama_decode(ctx_dft, batch) — the graph's mask tensor shape depends on
+    // batch.n_tokens and the binding API enforces exact-size match.
+    void rebind_mtp_attn_mask(llama_context * ctx_dft, int n_batch_tokens) {
+        if (mtp_kv_len <= 0 || n_batch_tokens <= 0) return;
+        const int64_t n_ctx = (int64_t) llama_n_ctx(ctx_dft);
+        const size_t  n     = (size_t)(n_ctx * n_batch_tokens);
+        mtp_attn_mask_buf.assign(n, -std::numeric_limits<float>::infinity());
+        // The same column [0..kv_len)=0, [kv_len..n_ctx)=-inf is repeated
+        // for every query row.
+        for (int t = 0; t < n_batch_tokens; ++t) {
+            float * row = mtp_attn_mask_buf.data() + (size_t)(t * n_ctx);
+            for (int64_t i = 0; i < mtp_kv_len; ++i) row[i] = 0.0f;
+        }
+        llama_set_input_tensor(ctx_dft, "mtp_attn_mask",
+            mtp_attn_mask_buf.data(), mtp_attn_mask_buf.size() * sizeof(float));
+    }
+
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq)
         , params(params.draft)
@@ -541,6 +568,61 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
 
+        // Gemma4-style MTP cross-attention: if the target model exposed shared
+        // K/V from its last sliding + last full attention layer, bind them
+        // into the drafter context so its graph_mtp cross-attention has K/V
+        // to consume. Other MTP arches (e.g. Qwen35) leave these zero-sized
+        // and this whole block is a no-op.
+        {
+            const size_t n_swa  = llama_get_shared_kv_swa_size (ctx_tgt);
+            const size_t n_full = llama_get_shared_kv_full_size(ctx_tgt);
+            if (n_swa > 0 && n_full > 0) {
+                const float * K_swa  = llama_get_shared_kv_K_swa (ctx_tgt);
+                const float * V_swa  = llama_get_shared_kv_V_swa (ctx_tgt);
+                const float * K_full = llama_get_shared_kv_K_full(ctx_tgt);
+                const float * V_full = llama_get_shared_kv_V_full(ctx_tgt);
+                if (K_swa && V_swa && K_full && V_full) {
+                    const size_t bytes_swa  = n_swa  * sizeof(float);
+                    const size_t bytes_full = n_full * sizeof(float);
+                    llama_set_input_tensor(ctx_dft, "mtp_shared_K_swa",  K_swa,  bytes_swa);
+                    llama_set_input_tensor(ctx_dft, "mtp_shared_V_swa",  V_swa,  bytes_swa);
+                    llama_set_input_tensor(ctx_dft, "mtp_shared_K_full", K_full, bytes_full);
+                    llama_set_input_tensor(ctx_dft, "mtp_shared_V_full", V_full, bytes_full);
+
+                    // mtp_attn_mask: 0 for valid K positions [0..kv_len),
+                    // -inf for padded tail. kv_len = main context's current
+                    // sequence length (last bound pos + 1). Without this, the
+                    // drafter's softmax includes zero-padded K rows.
+                    //
+                    // kv_len is encoded as the n_swa size divided by per-row
+                    // bytes: shared_K_swa is [hd, n_kv_h, n_ctx] F16. We don't
+                    // have direct access to kv_len here, so use the position
+                    // of the last batch token as a proxy (works for the
+                    // common case of one growing sequence per seq_id).
+                    int64_t kv_len = 0;
+                    for (int k = 0; k < batch_in.n_tokens; ++k) {
+                        if (batch_in.pos[k] + 1 > kv_len) kv_len = batch_in.pos[k] + 1;
+                    }
+                    const int64_t n_ctx_dft = (int64_t) llama_n_ctx(ctx_dft);
+                    if (kv_len > n_ctx_dft) kv_len = n_ctx_dft;
+                    // Save kv_len; the mask binding has to be re-done before
+                    // each llama_decode below because its required size is
+                    // n_ctx * batch.n_tokens which varies (verify=multi-token,
+                    // draft=single-token).
+                    mtp_kv_len = kv_len;
+
+                    // NOTE: h_in (mtp_h_input) is fed via batch.embd later in
+                    // this function (see set_h() and the memcpy of h_tgt).
+                    // We deliberately do NOT bind mtp_h_input here because the
+                    // batch.embd path needs to populate per-token rows for
+                    // batched verification — a single bound h_t would clobber
+                    // those. The batch.embd content currently comes from
+                    // llama_get_embeddings_pre_norm (pre-norm); HF's drafter
+                    // expects post-norm. TODO: switch to llama_get_last_hidden_state.
+                }
+            }
+        }
+
         common_batch_clear(batch);
 
         for (int k = 0; k < n_tokens; ++k) {
@@ -553,8 +635,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         //                                                       ^--- this is a problem
         // TODO:this is generally true, but would be nice to assert it
         {
-            const float * h_tgt = llama_get_embeddings_pre_norm(ctx_tgt);
-            std::memcpy(batch.embd + (size_t) 1 * n_embd, h_tgt, row_bytes * (n_tokens-1));
+            // HF's Gemma4Assistant drafter consumes POST-norm h_tgt (the
+            // base's `model.norm` output), not pre-norm. The diff harness in
+            // tools/diff_real_flow.py confirmed cos=0.999999 against HF on
+            // the post-norm path. Pre-norm gives 0% draft acceptance.
+            // We pull row-by-row via llama_get_last_hidden_state_ith.
+            for (uint32_t k = 0; k + 1 < n_tokens; ++k) {
+                const float * h = llama_get_last_hidden_state_ith(ctx_tgt, (int32_t) k);
+                if (!h) { LOG_ERR("%s: no last_hidden_state[%u]\n", __func__, k); continue; }
+                std::memcpy(batch.embd + (size_t)(k + 1) * n_embd, h, row_bytes);
+            }
 
             //{
             //    // string with seq_ids in the batch
@@ -579,6 +669,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             set_h(i_batch_beg[seq_id], pending_h[seq_id].data());
         }
 
+        rebind_mtp_attn_mask(ctx_dft, batch.n_tokens);
         const int32_t rc = llama_decode(ctx_dft, batch);
         if (rc != 0) {
             LOG_ERR("%s: llama_decode(ctx_dft) failed rc=%d (pos=%d)\n", __func__, (int) rc, (int) batch_in.pos[0]);
@@ -595,7 +686,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             verify_h[seq_id].resize((size_t) n_rows * n_embd);
 
             for (int32_t i = 0; i < n_rows; ++i) {
-                const float * h = llama_get_embeddings_pre_norm_ith(ctx_tgt, i_batch_beg[seq_id] + i);
+                const float * h = llama_get_last_hidden_state_ith(ctx_tgt, i_batch_beg[seq_id] + i);
+                if (!h) { LOG_ERR("%s: no last_hidden_state[%d]\n", __func__, i_batch_beg[seq_id] + i); continue; }
                 std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd, h, row_bytes);
             }
 
@@ -635,6 +727,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             std::memcpy(batch.embd + n_embd*(batch.n_tokens - 1), h_row, row_bytes);
         }
 
+        rebind_mtp_attn_mask(ctx_dft, batch.n_tokens);
         int ret = llama_decode(ctx_dft, batch);
         if (ret != 0) {
             LOG_WRN("%s: llama_decode returned %d\n", __func__, ret);
@@ -656,7 +749,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 auto * smpl = smpls[seq_id].get();
 
                 common_sampler_sample(smpl, ctx_dft, i_batch, true);
-                h_row = llama_get_embeddings_pre_norm_ith(ctx_dft, i_batch);
+                // For Gemma4 MTP, the drafter's recurrent state is t_h_pre_norm
+                // (post_projection output), exposed via llama_get_h_pre_norm_ith.
+                // The old llama_get_embeddings_pre_norm_ith reads ctx_dft's
+                // embd_pre_norm buffer which may not be populated for MTP ctx.
+                h_row = llama_get_h_pre_norm_ith(ctx_dft, i_batch);
+                if (!h_row) h_row = llama_get_embeddings_pre_norm_ith(ctx_dft, i_batch);
                 ++i_batch;
 
                 const auto * cur_p = common_sampler_get_candidates(smpl, true);
@@ -700,6 +798,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
 
             // evaluate the drafted tokens on the draft model
+            rebind_mtp_attn_mask(ctx_dft, batch.n_tokens);
             ret = llama_decode(ctx_dft, batch);
             if (ret != 0) {
                 LOG_WRN("%s: llama_decode[%d] returned %d\n", __func__, i, ret);

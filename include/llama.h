@@ -1021,6 +1021,122 @@ extern "C" {
     LLAMA_API float * llama_get_embeddings_seq(struct llama_context * ctx, llama_seq_id seq_id);
 
     //
+    // Gemma4-style MTP shared K/V accessors [EXPERIMENTAL]
+    //
+    // After a main-pass llama_decode() on a model with a Gemma4 MTP overlay,
+    // these return pointers to the K/V tensors captured from the main model's
+    // LAST non-kv-shared sliding-attention layer (resp. full-attention layer).
+    // The data is laid out as [head_dim, n_head_kv, n_tokens] in row-major order
+    // (least-significant dim first). Returns NULL if the model doesn't ship an
+    // MTP overlay or if no main forward has run yet.
+    //
+    // The driver (e.g. common/speculative.cpp) reads these and binds them as
+    // inputs ("mtp_shared_K_swa", "mtp_shared_V_swa", "mtp_shared_K_full",
+    // "mtp_shared_V_full") to the MTP context before each draft step.
+    LLAMA_API const float * llama_get_shared_kv_K_swa  (struct llama_context * ctx);
+    LLAMA_API const float * llama_get_shared_kv_V_swa  (struct llama_context * ctx);
+    LLAMA_API const float * llama_get_shared_kv_K_full (struct llama_context * ctx);
+    LLAMA_API const float * llama_get_shared_kv_V_full (struct llama_context * ctx);
+    // Size in floats (zero if not available).
+    LLAMA_API size_t        llama_get_shared_kv_swa_size  (struct llama_context * ctx);
+    LLAMA_API size_t        llama_get_shared_kv_full_size (struct llama_context * ctx);
+
+    // Gemma4-style MTP h_input plumbing.
+    //
+    // last_hidden_state: base model's final post-norm hidden state captured on
+    //   ctx_tgt's main pass. Layout [backbone_dim, n_outputs] row-major, fp32.
+    //   Bound as "mtp_h_input" on ctx_dft before the FIRST MTP step.
+    //
+    // h_pre_norm: drafter's post_projection output from the previous MTP step
+    //   on ctx_dft. Layout [backbone_dim, n_tokens] row-major, fp32. Bound as
+    //   "mtp_h_input" on ctx_dft before SUBSEQUENT MTP steps (so the drafter
+    //   sees its own recurrent state).
+    //
+    // Without these bindings, mtp_h_input is uninitialized and the drafter
+    // produces garbage. See H_INPUT_BUG.md.
+    LLAMA_API const float * llama_get_last_hidden_state      (struct llama_context * ctx);
+    LLAMA_API size_t        llama_get_last_hidden_state_size (struct llama_context * ctx);
+    // Per-token slice. The capture buffer holds [n_embd * n_tokens] floats;
+    // this returns the i-th token's row. i==-1 means the LAST row. Returns
+    // NULL on out-of-range or if no capture happened.
+    LLAMA_API const float * llama_get_last_hidden_state_ith  (struct llama_context * ctx, int32_t i);
+    LLAMA_API const float * llama_get_h_pre_norm             (struct llama_context * ctx);
+    LLAMA_API size_t        llama_get_h_pre_norm_size        (struct llama_context * ctx);
+    LLAMA_API const float * llama_get_h_pre_norm_ith         (struct llama_context * ctx, int32_t i);
+
+    // Probe whether a GGUF file is an MTP-overlay-only file (no full base
+    // hparams; has mtp.* keys). Used by drivers to route an "-md overlay.gguf"
+    // through llama_model_load_mtp_overlay instead of llama_model_load_from_file.
+    // Returns true iff path opens as a valid GGUF AND contains
+    // "{arch}.mtp.hidden_size" AND does NOT contain "{arch}.context_length".
+    LLAMA_API bool llama_gguf_is_mtp_overlay(const char * path);
+
+    // Debug-tap accessors: the model graph may emplace named intermediate
+    // tensors that get extracted to the host after forward. Used by
+    // test-gemma4-mtp-ref-diff to compare against an HF reference layer-by-
+    // layer. Empty list if no taps were registered.
+    LLAMA_API int           llama_get_dbg_tap_count(struct llama_context * ctx);
+    LLAMA_API const char *  llama_get_dbg_tap_name (struct llama_context * ctx, int i);
+    LLAMA_API const float * llama_get_dbg_tap_data (struct llama_context * ctx, const char * name);
+    LLAMA_API size_t        llama_get_dbg_tap_size (struct llama_context * ctx, const char * name);
+
+    // Bind data into a named ggml input tensor of the upcoming decode's graph.
+    // Used to feed externally-supplied inputs (e.g. Gemma4 MTP shared K/V from
+    // the main pass). The data pointer is BORROWED — the caller must keep the
+    // source alive across decodes. Bindings persist until cleared or
+    // overwritten. Returns false if name or data is NULL.
+    //
+    // !! LIFETIME HAZARD !! `data` must outlive every llama_decode call that
+    // uses this binding. A common bug: passing a stack vector that goes out of
+    // scope. The binding reads from the pointer AT DECODE TIME, not bind time.
+    // Declare backing buffers in the outermost scope that contains all decodes.
+    //
+    // Typical usage for Gemma4 MTP (driver in common/speculative.cpp):
+    //
+    //   llama_decode(ctx_main, batch);
+    //
+    //   const float * K_swa = llama_get_shared_kv_K_swa(ctx_main);
+    //   ...
+    //
+    //   llama_set_input_tensor(ctx_mtp, "mtp_shared_K_swa",
+    //       K_swa, llama_get_shared_kv_swa_size(ctx_main) * sizeof(float));
+    //   ... and same for V_swa, K_full, V_full ...
+    //
+    //   for (step = 0; step < n_draft; ++step) {
+    //       llama_decode(ctx_mtp, draft_batch);
+    //       // sample → next draft token → next iteration
+    //   }
+    LLAMA_API bool llama_set_input_tensor(
+        struct llama_context * ctx,
+        const char           * name,
+        const void           * data,
+        size_t                 n_bytes);
+
+    // Drop all previously-set named bindings (e.g. before a fresh prompt).
+    LLAMA_API void llama_clear_input_tensor_bindings(struct llama_context * ctx);
+
+    // Attach a Multi-Token-Prediction (MTP) overlay onto an already-loaded
+    // base model. The overlay file is a slim GGUF containing only the
+    // mtp.* tensors and gemma4.mtp.* metadata (built via
+    // `convert_hf_to_gguf.py --mtp` from a *-it-assistant repo).
+    //
+    // Validates: arch == "gemma4", vocab size matches the base, backbone
+    // hidden size implied by mtp.pre_proj shape matches the base's n_embd.
+    //
+    // Returns 0 on success, non-zero (negative) on error. Repeated calls
+    // overwrite the previous overlay.
+    //
+    // Typical use (driver):
+    //   llama_model * model = llama_model_load_from_file("gemma-4-31B-it.gguf", ...);
+    //   int rc = llama_model_load_mtp_overlay(model, "gemma-4-31B-it-mtp.gguf");
+    //   if (rc != 0) { error... }
+    //   llama_context * ctx_dft = llama_init_from_model(model, mtp_ctx_params);
+    //   // ctx_dft now serves the MTP draft head.
+    LLAMA_API int32_t llama_model_load_mtp_overlay(
+        struct llama_model * model,
+        const char         * path);
+
+    //
     // backend sampling API [EXPERIMENTAL]
     // note: use only if the llama_context was created with at least one llama_sampler_seq_config
     //

@@ -6,6 +6,7 @@
 #include "llama-hparams.h"
 #include "llama-memory.h"
 #include "llama-vocab.h"
+#include "ggml-cpp.h"
 
 #include <map>
 #include <memory>
@@ -208,6 +209,49 @@ struct llama_layer_nextn {
     struct ggml_tensor * hnorm            = nullptr;
     struct ggml_tensor * shared_head_head = nullptr;
     struct ggml_tensor * shared_head_norm = nullptr;
+};
+
+// Gemma4-style multi-block MTP overlay
+struct llama_mtp_layer {
+    // norms
+    struct ggml_tensor * attn_norm       = nullptr;
+    struct ggml_tensor * attn_post_norm  = nullptr;
+    struct ggml_tensor * ffn_pre_norm    = nullptr;
+    struct ggml_tensor * ffn_post_norm   = nullptr;
+
+    // attention (no wk/wv — Gemma4 uses cross-attention to main model's shared KV)
+    struct ggml_tensor * wq              = nullptr;
+    struct ggml_tensor * attn_q_norm     = nullptr;
+    struct ggml_tensor * wo              = nullptr;
+
+    // mlp
+    struct ggml_tensor * ffn_gate        = nullptr;
+    struct ggml_tensor * ffn_up          = nullptr;
+    struct ggml_tensor * ffn_down        = nullptr;
+
+    // Gemma4 layer_scalar (per-block scalar multiplier after the block)
+    struct ggml_tensor * out_scale       = nullptr;
+};
+
+struct llama_mtp_block {
+    struct ggml_tensor * pre_proj     = nullptr;  // 2*backbone × mtp_hidden
+    struct ggml_tensor * post_proj    = nullptr;  // mtp_hidden × backbone
+    struct ggml_tensor * norm         = nullptr;  // final drafter norm
+    struct ggml_tensor * embed_tokens = nullptr;  // tied lm_head at mtp_hidden
+
+    // Gemma4Assistant MaskedEmbedder (only when hparams.mtp_use_ordered_embeddings).
+    struct ggml_tensor * masked_emb_centroids      = nullptr; // [num_centroids, mtp_hidden]
+    struct ggml_tensor * masked_emb_token_ordering = nullptr; // [vocab] f32 (values are int indices)
+
+    std::vector<llama_mtp_layer> layers;
+
+    // ggml_context owning the tensor data when populated via
+    // llama_model_load_mtp_overlay() (CPU-resident first cut; the scheduler
+    // handles cross-backend copies at compute time). NULL when MTP tensors
+    // are loaded via the standard load_arch_tensors path (combined GGUF).
+    ggml_context_ptr overlay_ctx;
+
+    bool empty() const { return pre_proj == nullptr; }
 };
 
 struct llama_layer {
@@ -556,6 +600,9 @@ struct llama_model {
     struct ggml_tensor * per_layer_proj_norm  = nullptr;
 
     std::vector<llama_layer> layers;
+
+    // Gemma4-style multi-block MTP overlay (populated only for archs that ship one)
+    llama_mtp_block mtp;
 
     //Dense linear projections for SentenceTransformers models like embeddinggemma
     // For Sentence Transformers models structure see
