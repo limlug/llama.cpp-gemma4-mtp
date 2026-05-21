@@ -2268,6 +2268,18 @@ class TensorNameMap:
         MODEL_TENSOR.NEXTN_SHARED_HEAD_NORM: (
             "model.layers.{bid}.shared_head.norm",
         ),
+
+        # Gemma4-style multi-block MTP overlay (cross-attention drafter).
+        # ONLY include HF names that are UNIQUE to the drafter — the rest
+        # (model.embed_tokens, model.norm, model.layers.*) collide with the
+        # base Gemma4 model's HF names and are handled explicitly by
+        # Gemma4AssistantModel.modify_tensors via format_tensor_name(MTP_*).
+        MODEL_TENSOR.MTP_PRE_PROJ: (
+            "pre_projection",   # gemma-4-31B-it-assistant
+        ),
+        MODEL_TENSOR.MTP_POST_PROJ: (
+            "post_projection",
+        ),
     }
 
     # architecture-specific block mappings
