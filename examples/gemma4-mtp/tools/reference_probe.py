@@ -142,10 +142,16 @@ def main() -> int:
     h_part = 0.1 * torch.randn(BATCH, SEQ, bh, generator=rng)
     inputs_embeds = torch.cat([h_part, e_part], dim=-1).contiguous()  # [B, S, 2*bh]
     position_ids  = torch.arange(SEQ).unsqueeze(0).expand(BATCH, -1).contiguous()
-    K_swa  = 0.1 * torch.randn(BATCH, n_kv_heads, KV_LEN, head_dim_swa,  generator=rng)
-    V_swa  = 0.1 * torch.randn(BATCH, n_kv_heads, KV_LEN, head_dim_swa,  generator=rng)
-    K_full = 0.1 * torch.randn(BATCH, n_kv_heads, KV_LEN, head_dim_full, generator=rng)
-    V_full = 0.1 * torch.randn(BATCH, n_kv_heads, KV_LEN, head_dim_full, generator=rng)
+    # Gemma4Assistant with attention_k_eq_v=True uses a smaller KV head
+    # count for FULL-attention layers (num_global_key_value_heads).
+    # Fall back to num_key_value_heads when absent (E2B-style).
+    n_kv_heads_swa  = n_kv_heads
+    n_kv_heads_full = getattr(tcfg, "num_global_key_value_heads", None) or n_kv_heads
+    print(f"  n_kv_heads: swa={n_kv_heads_swa}  full={n_kv_heads_full}")
+    K_swa  = 0.1 * torch.randn(BATCH, n_kv_heads_swa,  KV_LEN, head_dim_swa,  generator=rng)
+    V_swa  = 0.1 * torch.randn(BATCH, n_kv_heads_swa,  KV_LEN, head_dim_swa,  generator=rng)
+    K_full = 0.1 * torch.randn(BATCH, n_kv_heads_full, KV_LEN, head_dim_full, generator=rng)
+    V_full = 0.1 * torch.randn(BATCH, n_kv_heads_full, KV_LEN, head_dim_full, generator=rng)
     attention_mask = torch.ones(BATCH, KV_LEN, dtype=torch.long)
     print(f"  token_ids: {token_ids.flatten().tolist()}")
     print(f"  e_part[0,0,:8]: {e_part[0,0,:8].tolist()}")
