@@ -912,6 +912,11 @@ class Gemma4AssistantModel(TextModel):
         self.gguf_writer.add_mtp_intermediate_size(intermediate)
         self.gguf_writer.add_mtp_head_count(n_head)
         self.gguf_writer.add_mtp_head_count_kv(n_head_kv)
+        # Gemma4Assistant (attention_k_eq_v=True) uses a DIFFERENT KV head
+        # count for full-attention layers (num_global_key_value_heads).
+        # Defaults to n_head_kv when absent (E2B-style, attention_k_eq_v=False).
+        global_n_head_kv = int(self.hparams.get("num_global_key_value_heads") or n_head_kv)
+        self.gguf_writer.add_mtp_global_head_count_kv(global_n_head_kv)
         self.gguf_writer.add_mtp_head_dim(head_dim)
         self.gguf_writer.add_mtp_global_head_dim(global_head_dim)
         self.gguf_writer.add_mtp_sliding_window(sliding_window)

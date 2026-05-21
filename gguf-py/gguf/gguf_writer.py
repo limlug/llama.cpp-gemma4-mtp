@@ -882,6 +882,9 @@ class GGUFWriter:
     def add_mtp_head_count_kv(self, value: int) -> None:
         self.add_uint32(Keys.MTP.N_HEAD_KV.format(arch=self.arch), value)
 
+    def add_mtp_global_head_count_kv(self, value: int) -> None:
+        self.add_uint32(Keys.MTP.GLOBAL_N_HEAD_KV.format(arch=self.arch), value)
+
     def add_mtp_head_dim(self, value: int) -> None:
         self.add_uint32(Keys.MTP.HEAD_DIM.format(arch=self.arch), value)
 

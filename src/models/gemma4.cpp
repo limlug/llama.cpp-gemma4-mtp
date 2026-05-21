@@ -40,6 +40,10 @@ void llama_model_gemma4::load_arch_hparams(llama_model_loader & ml) {
         ml.get_key(LLM_KV_MTP_INTERMEDIATE_SIZE,  hparams.mtp_n_ff,            true);
         ml.get_key(LLM_KV_MTP_N_HEAD,             hparams.mtp_n_head,          true);
         ml.get_key(LLM_KV_MTP_N_HEAD_KV,          hparams.mtp_n_head_kv,       true);
+        // Optional: separate KV head count for full-attention layers.
+        // Defaults to mtp_n_head_kv when the key is absent (E2B-style).
+        hparams.mtp_global_n_head_kv = hparams.mtp_n_head_kv;
+        ml.get_key(LLM_KV_MTP_GLOBAL_N_HEAD_KV,   hparams.mtp_global_n_head_kv, false);
         ml.get_key(LLM_KV_MTP_HEAD_DIM,           hparams.mtp_n_embd_head_k,   true);
         ml.get_key(LLM_KV_MTP_GLOBAL_HEAD_DIM,    hparams.mtp_global_head_dim, true);
         ml.get_key(LLM_KV_MTP_SLIDING_WINDOW,     hparams.mtp_sliding_window,  false);
@@ -770,18 +774,19 @@ llama_model_gemma4::graph_mtp::graph_mtp(
     // per-ubatch Kcur/Vcur which is only the latest position. The driver-side
     // path that maintains a growing buffer (or extracts from the main KV
     // cache) is still TODO.
-    const int64_t kv_max     = (int64_t) cparams.n_ctx;
-    const int64_t mtp_n_kv   = (int64_t) hparams.mtp_n_head_kv;       // 16
-    const int64_t hd_swa     = (int64_t) hparams.mtp_n_embd_head_k;   // 256
-    const int64_t hd_full    = (int64_t) hparams.mtp_global_head_dim; // 512
+    const int64_t kv_max         = (int64_t) cparams.n_ctx;
+    const int64_t mtp_n_kv_swa   = (int64_t) hparams.mtp_n_head_kv;        // 16 (31B SWA) / 1 (E2B)
+    const int64_t mtp_n_kv_full  = (int64_t) hparams.mtp_global_n_head_kv; //  4 (31B FULL) / 1 (E2B)
+    const int64_t hd_swa         = (int64_t) hparams.mtp_n_embd_head_k;    // 256
+    const int64_t hd_full        = (int64_t) hparams.mtp_global_head_dim;  // 512
 
     // Match the KV cache's storage type (F16) so binding doesn't require
     // per-decode dequant. The cross-attention math inside build_cross_attn_no_cache
     // promotes to F32 via ggml_mul_mat_set_prec(GGML_PREC_F32).
-    ggml_tensor * shared_K_swa  = ggml_new_tensor_3d(ctx0, GGML_TYPE_F16, hd_swa,  mtp_n_kv, kv_max);
-    ggml_tensor * shared_V_swa  = ggml_new_tensor_3d(ctx0, GGML_TYPE_F16, hd_swa,  mtp_n_kv, kv_max);
-    ggml_tensor * shared_K_full = ggml_new_tensor_3d(ctx0, GGML_TYPE_F16, hd_full, mtp_n_kv, kv_max);
-    ggml_tensor * shared_V_full = ggml_new_tensor_3d(ctx0, GGML_TYPE_F16, hd_full, mtp_n_kv, kv_max);
+    ggml_tensor * shared_K_swa  = ggml_new_tensor_3d(ctx0, GGML_TYPE_F16, hd_swa,  mtp_n_kv_swa,  kv_max);
+    ggml_tensor * shared_V_swa  = ggml_new_tensor_3d(ctx0, GGML_TYPE_F16, hd_swa,  mtp_n_kv_swa,  kv_max);
+    ggml_tensor * shared_K_full = ggml_new_tensor_3d(ctx0, GGML_TYPE_F16, hd_full, mtp_n_kv_full, kv_max);
+    ggml_tensor * shared_V_full = ggml_new_tensor_3d(ctx0, GGML_TYPE_F16, hd_full, mtp_n_kv_full, kv_max);
     ggml_set_input(shared_K_swa);  ggml_set_name(shared_K_swa,  "mtp_shared_K_swa");
     ggml_set_input(shared_V_swa);  ggml_set_name(shared_V_swa,  "mtp_shared_V_swa");
     ggml_set_input(shared_K_full); ggml_set_name(shared_K_full, "mtp_shared_K_full");

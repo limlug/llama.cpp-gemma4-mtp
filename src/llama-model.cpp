@@ -2701,6 +2701,13 @@ int32_t llama_model_load_mtp_overlay(llama_model * model, const char * path) {
     hp.mtp_n_ff            = mtp_ff;
     hp.mtp_n_head          = mtp_head;
     hp.mtp_n_head_kv       = mtp_head_kv;
+    // Optional: separate KV head count for full-attention layers
+    // (Gemma4Assistant attention_k_eq_v=True). Default to mtp_n_head_kv.
+    {
+        uint32_t gnkv = mtp_head_kv;
+        get_u32("gemma4.mtp.attention.global_head_count_kv", &gnkv);
+        hp.mtp_global_n_head_kv = gnkv;
+    }
     hp.mtp_n_embd_head_k   = mtp_head_dim;
     hp.mtp_global_head_dim = mtp_global_head_dim;
     hp.mtp_sliding_window  = mtp_sw;

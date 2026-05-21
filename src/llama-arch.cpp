@@ -197,6 +197,7 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_MTP_INTERMEDIATE_SIZE,             "%s.mtp.intermediate_size"                 },
     { LLM_KV_MTP_N_HEAD,                        "%s.mtp.attention.head_count"              },
     { LLM_KV_MTP_N_HEAD_KV,                     "%s.mtp.attention.head_count_kv"           },
+    { LLM_KV_MTP_GLOBAL_N_HEAD_KV,              "%s.mtp.attention.global_head_count_kv"    },
     { LLM_KV_MTP_HEAD_DIM,                      "%s.mtp.attention.head_dim"                },
     { LLM_KV_MTP_GLOBAL_HEAD_DIM,               "%s.mtp.attention.global_head_dim"         },
     { LLM_KV_MTP_SLIDING_WINDOW,                "%s.mtp.attention.sliding_window"          },

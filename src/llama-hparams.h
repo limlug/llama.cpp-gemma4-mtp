@@ -104,6 +104,10 @@ struct llama_hparams {
     uint32_t mtp_n_ff            = 0;
     uint32_t mtp_n_head          = 0;
     uint32_t mtp_n_head_kv       = 0;
+    // KV head count for full-attention layers (Gemma4Assistant with
+    // attention_k_eq_v=True uses fewer KV heads for full than for SWA).
+    // Defaults to mtp_n_head_kv if the overlay GGUF doesn't carry the key.
+    uint32_t mtp_global_n_head_kv = 0;
     uint32_t mtp_n_embd_head_k   = 0;  // per-head dim for sliding-attention layers
     uint32_t mtp_global_head_dim = 0;  // per-head dim for full-attention layer(s)
     uint32_t mtp_sliding_window  = 0;

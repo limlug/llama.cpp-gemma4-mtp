@@ -236,6 +236,10 @@ class Keys:
         INTERMEDIATE_SIZE        = "{arch}.mtp.intermediate_size"
         N_HEAD                   = "{arch}.mtp.attention.head_count"
         N_HEAD_KV                = "{arch}.mtp.attention.head_count_kv"
+        # Gemma4Assistant (attention_k_eq_v=True) uses a SMALLER KV head
+        # count for the full-attention layers. Defaults to N_HEAD_KV when
+        # absent (E2B-style where SWA and full share the same kv count).
+        GLOBAL_N_HEAD_KV         = "{arch}.mtp.attention.global_head_count_kv"
         HEAD_DIM                 = "{arch}.mtp.attention.head_dim"
         GLOBAL_HEAD_DIM          = "{arch}.mtp.attention.global_head_dim"
         SLIDING_WINDOW           = "{arch}.mtp.attention.sliding_window"
