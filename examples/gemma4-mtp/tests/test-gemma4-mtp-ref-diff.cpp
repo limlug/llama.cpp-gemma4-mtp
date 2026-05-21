@@ -201,12 +201,13 @@ int main(int argc, char ** argv) {
     };
     const int64_t HD_SWA  = ks_e->shape[3];
     const int64_t HD_FULL = kf_e->shape[3];
-    const int64_t N_KV_H  = ks_e->shape[1];
+    const int64_t N_KV_H_SWA  = ks_e->shape[1];
+    const int64_t N_KV_H_FULL = kf_e->shape[1];  // 31B has fewer KV heads for FULL
     const int64_t KV_LEN  = ks_e->shape[2];
-    std::vector<uint16_t> K_swa_f16  = convert_and_pad(ks_data, ks_e->n_bytes, HD_SWA,  N_KV_H, KV_LEN);
-    std::vector<uint16_t> V_swa_f16  = convert_and_pad(vs_data, vs_e->n_bytes, HD_SWA,  N_KV_H, KV_LEN);
-    std::vector<uint16_t> K_full_f16 = convert_and_pad(kf_data, kf_e->n_bytes, HD_FULL, N_KV_H, KV_LEN);
-    std::vector<uint16_t> V_full_f16 = convert_and_pad(vf_data, vf_e->n_bytes, HD_FULL, N_KV_H, KV_LEN);
+    std::vector<uint16_t> K_swa_f16  = convert_and_pad(ks_data, ks_e->n_bytes, HD_SWA,  N_KV_H_SWA,  KV_LEN);
+    std::vector<uint16_t> V_swa_f16  = convert_and_pad(vs_data, vs_e->n_bytes, HD_SWA,  N_KV_H_SWA,  KV_LEN);
+    std::vector<uint16_t> K_full_f16 = convert_and_pad(kf_data, kf_e->n_bytes, HD_FULL, N_KV_H_FULL, KV_LEN);
+    std::vector<uint16_t> V_full_f16 = convert_and_pad(vf_data, vf_e->n_bytes, HD_FULL, N_KV_H_FULL, KV_LEN);
     llama_set_input_tensor(ctx, "mtp_shared_K_swa",  K_swa_f16.data(),  K_swa_f16.size()  * sizeof(uint16_t));
     llama_set_input_tensor(ctx, "mtp_shared_V_swa",  V_swa_f16.data(),  V_swa_f16.size()  * sizeof(uint16_t));
     llama_set_input_tensor(ctx, "mtp_shared_K_full", K_full_f16.data(), K_full_f16.size() * sizeof(uint16_t));
