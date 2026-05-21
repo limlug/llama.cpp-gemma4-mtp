@@ -7,22 +7,29 @@ through the standard `llama-server` speculative-decoding pipeline.
 
 ## Status
 
-**Numerically verified against the HuggingFace reference** for the E2B
-variant:
+**Numerically verified against the HuggingFace reference** for both the
+E2B and 31B variants. Diff harness with seeded synthetic inputs:
 
-| Stage | cosine vs HF | argmax match |
+| Stage | E2B cos | 31B cos | argmax match |
+|---|---|---|---|
+| base `last_hidden_state` (post-norm `h_t`) | 0.999999 | 0.999999 | ✓ |
+| `pre_projection` | 1.000000 | 1.000000 | ✓ |
+| `L0.q_proj`, `L0.q_norm`, `L0.input_layernorm` | 1.000000 | 1.000000 | ✓ |
+| `L0.attn_out_pre_o_proj` (F32 controlled) | 1.000000 | 1.000000 | ✓ |
+| `L0.attn_out_pre_o_proj` (real F16 KV cache) | 0.962 | 0.83 | ≠ (F16 noise) |
+| `model.norm` | 0.999997 | 0.999999 | ✓ |
+| `post_projection` | 0.999995 | 0.999999 | ✓ |
+| **logits (masked or plain)** | **0.999999** | **1.000000** | **✓** |
+
+End-to-end speculative decoding via `llama-server` produces coherent text:
+
+| Model | Backend | Acceptance rate |
 |---|---|---|
-| base `last_hidden_state` (post-norm `h_t`) | 0.999999 | ✓ |
-| `pre_projection` | 1.000000 | ✓ |
-| `L0.q_proj`, `L0.q_norm`, `L0.input_layernorm` | 1.000000 | ✓ |
-| `L0.attn_out_pre_o_proj` (F32 controlled inputs) | 1.000000 | ✓ |
-| `L0.attn_out_pre_o_proj` (real F16 KV cache) | 0.962 | ≠ (F16 noise) |
-| `model.norm` | 0.999997 | ✓ |
-| `post_projection` | 0.999995 | ✓ |
-| **reconstructed masked `logits`** | **0.999999** | **✓** |
+| E2B-it-assistant | CPU + GPU | 0% (intrinsic — drafter weak on standalone prompts) |
+| 31B-it-assistant | CPU | **8.3%** ("The capital of France is" → "Paris.\\n\\nThe capital of France is Paris...") |
+| 31B-it-assistant | GPU (`-ngl 99`) | crashes during init — see `docs/31B_STATUS.md` |
 
-End-to-end speculative decoding via `llama-server` produces coherent text on
-real chat prompts. See `docs/` for the design and per-bug post-mortems.
+See `docs/` for the design and per-bug post-mortems.
 
 ## Quick start
 
