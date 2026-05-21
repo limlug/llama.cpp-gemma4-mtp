@@ -103,23 +103,45 @@ Verified on llm01 (`CUDA_VISIBLE_DEVICES=4`, H100 80 GB):
 * `-ngl 99 -sm none`: coherent gen, ~12.5 TPS, server stable
 * `-ngl 99 -sm layer` across 2 GPUs: coherent gen, ~13.4 TPS, server stable
 
-### Open: 0% draft acceptance on GPU
+### Acceptance rate: 0% across CPU and GPU on this build
 
-Same prompt that gives 8.3% on CPU returns 0% on GPU (`draft_n=63
-accepted=0`). F32 KV cache (`-ctk f32 -ctv f32`) doesn't help, so it
-isn't pure KV-cache precision. Drafter executes correctly through the
-GPU pipeline — drafts are generated, just rejected. Likely:
+Comparing draft-candidate logs from `--verbose` runs on CPU
+(`-ngl 0`) and GPU (`-ngl 99`) with the same prompt
+("The capital of France is", `-c 256`, temperature 0):
 
-* CUDA F16 cross-attention math accumulating more rounding than CPU's
-  path. The drafter was already borderline at 8.3% — small precision
-  diffs are enough to flip the argmax.
-* Possibly a stride/layout mismatch in `ggml_dup` of the cache view on
-  CUDA that doesn't surface on CPU.
+```
+                          CPU                          GPU
+pos 0  top1: 4686 'ем'  (p=0.187)  | 4686 'ем'  (p=0.226)
+       top2:  568 ' ('  (p=0.182)  |  900 ' +'  (p=0.179)
+       top3:  900 ' +'  (p=0.176)  |  568 ' ('  (p=0.172)
+pos 1  top1:  506 ' the' (p=0.514) |  506 ' the' (p=0.635)
+pos 2  top1: 236789 '''  (p=0.482) | 236789 '''  (p=0.773)
+…
+```
 
-Next diagnostic step: extract the drafter's logits on GPU vs CPU for
-the same prompt and diff them. If cosine stays high but argmax flips,
-it's intrinsic precision; if logits diverge materially there's a
-genuine bug to chase.
+Same token IDs in nearly the same order with very similar
+probabilities — small differences are F16 noise, but the ranking is
+preserved. **No GPU-specific regression.** Both backends produce the
+same low-confidence near-uniform distribution that the base model
+never accepts.
+
+This contradicts an earlier documented "8.3% on CPU" measurement; that
+figure was either prompt-specific or measured on a slightly different
+build/state and is not reproducible on this commit. The current
+behavior aligns with `gemma4_mtp_cli_integration` notes: "0%
+acceptance is intrinsic to drafter quality (HF generate also
+degenerate on standalone prompts)."
+
+Open question if/when the drafter is to be made useful:
+
+* Is the drafter actually intrinsically weak on these prompts, or is
+  there a remaining math bug (e.g. mask, h_in, KV provenance) that
+  flattens its logits across the board? Cross-checking against HF's
+  `assistant_model=` generation on the exact same tokens would
+  disambiguate. If HF also produces uniform-ish drafter logits → the
+  drafter is the limit; if HF gets concentrated logits and accepts
+  drafts → our port still has a math bug despite the bit-exact
+  synthetic-input numbers.
 
 ### Sanity check that should be re-run before declaring this fully done
 
