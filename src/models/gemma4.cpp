@@ -425,20 +425,22 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
                 // Materialize copies of the cache views via ggml_dup so the
                 // backend scheduler tracks them and they appear as real
                 // compute nodes (the raw view tensors are not registered).
-                // Capture K/V from the cache view. The base KV cache stores V
-                // in the v_trans=true layout [n_ctx, n_head_kv, hd] (n_ctx is
-                // the FASTEST-varying dim), while the MTP drafter graph
-                // declares mtp_shared_V_* as [hd, n_head_kv, n_ctx] (hd is
-                // fastest). A bit-copy from the cache dup into mtp_shared_V_*
-                // would misinterpret the data. So we ggml_permute V back to
-                // [hd, n_head_kv, n_ctx] before ggml_dup. K is fine — it's
-                // stored with the same layout the drafter expects.
-                auto capture_v = [&](ggml_tensor * raw_V) -> ggml_tensor * {
+                // Capture K/V from the cache view. WITHOUT flash attention
+                // the base KV cache stores V in v_trans=true layout
+                // [n_ctx, n_head_kv, hd] (n_ctx is the FASTEST-varying dim);
+                // WITH flash attention V is in the same [hd, n_head_kv, n_ctx]
+                // layout as K. The drafter graph declares mtp_shared_V_* as
+                // [hd, n_head_kv, n_ctx], so we ggml_permute V back to canonical
+                // only when ne[0] != head_dim (i.e. v_trans=true mode). K is
+                // always in canonical layout.
+                const int64_t expect_hd_v_swa  = (int64_t) hparams.n_embd_head_v(il);
+                auto capture_v = [&](ggml_tensor * raw_V, int64_t expect_hd) -> ggml_tensor * {
                     if (!raw_V) return nullptr;
-                    // ne[0]=n_ctx (v_trans), ne[1]=n_head_kv, ne[2]=hd → permute
-                    // to (hd, n_head_kv, n_ctx) i.e. swap axes 0 and 2.
-                    ggml_tensor * v_perm = ggml_permute(ctx0, raw_V, 2, 1, 0, 3);
-                    return ggml_cont(ctx0, v_perm);
+                    if (raw_V->ne[0] != expect_hd) {
+                        ggml_tensor * v_perm = ggml_permute(ctx0, raw_V, 2, 1, 0, 3);
+                        return ggml_cont(ctx0, v_perm);
+                    }
+                    return ggml_dup(ctx0, raw_V);
                 };
                 if (il == last_kv_swa) {
                     const auto * kv_swa = inp_attn->mctx->get_swa();
@@ -446,7 +448,7 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
                         ggml_tensor * raw_K = kv_swa->get_k(ctx0, il);
                         ggml_tensor * raw_V = kv_swa->get_v(ctx0, il);
                         res->t_shared_K_swa = ggml_dup(ctx0, raw_K);
-                        res->t_shared_V_swa = capture_v(raw_V);
+                        res->t_shared_V_swa = capture_v(raw_V, expect_hd_v_swa);
                         cb(res->t_shared_K_swa, "mtp_shared_K_swa", il);
                         cb(res->t_shared_V_swa, "mtp_shared_V_swa", il);
                         ggml_build_forward_expand(gf, res->t_shared_K_swa);
@@ -458,7 +460,7 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
                         ggml_tensor * raw_K = kv_base->get_k(ctx0, il);
                         ggml_tensor * raw_V = kv_base->get_v(ctx0, il);
                         res->t_shared_K_full = ggml_dup(ctx0, raw_K);
-                        res->t_shared_V_full = capture_v(raw_V);
+                        res->t_shared_V_full = capture_v(raw_V, (int64_t) hparams.n_embd_head_v(il));
                         cb(res->t_shared_K_full, "mtp_shared_K_full", il);
                         cb(res->t_shared_V_full, "mtp_shared_V_full", il);
                         ggml_build_forward_expand(gf, res->t_shared_K_full);

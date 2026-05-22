@@ -134,6 +134,7 @@ struct llama_context {
     // same name. Returns false if data is NULL.
     bool set_input_tensor(const char * name, const void * data, size_t n_bytes);
     void clear_input_tensor_bindings();
+    size_t get_input_tensor_size(const char * name) const;
 
     llama_token * get_sampled_tokens() const;
     llama_token   get_sampled_token_ith(int32_t idx);

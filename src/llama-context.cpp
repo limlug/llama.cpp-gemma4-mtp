@@ -3232,6 +3232,29 @@ void llama_context::clear_input_tensor_bindings() {
     input_tensor_bindings.clear();
 }
 
+size_t llama_context::get_input_tensor_size(const char * name) const {
+    // Mirror the lookup table in process_ubatch's binding-application loop
+    // so callers can size their padding buffers correctly before calling
+    // llama_set_input_tensor. We use the reserve-time graph result because
+    // input tensors have fixed shapes set at graph build time.
+    auto * res = gf_res_reserve.get();
+    if (!res || !name) return 0;
+    struct mapping { const char * name; ggml_tensor * tensor; };
+    const mapping known[] = {
+        { "mtp_shared_K_swa",  res->t_inp_mtp_shared_K_swa  },
+        { "mtp_shared_V_swa",  res->t_inp_mtp_shared_V_swa  },
+        { "mtp_shared_K_full", res->t_inp_mtp_shared_K_full },
+        { "mtp_shared_V_full", res->t_inp_mtp_shared_V_full },
+        { "mtp_h_input",       res->t_inp_mtp_h_input       },
+        { "mtp_attn_mask",     res->t_inp_mtp_attn_mask     },
+        { "mtp_const_one",     res->t_inp_mtp_const_one     },
+    };
+    for (const auto & m : known) {
+        if (std::string(m.name) == name) return m.tensor ? ggml_nbytes(m.tensor) : 0;
+    }
+    return 0;
+}
+
 llama_memory_breakdown llama_context::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, llama_memory_breakdown_data> ret;
     for (const auto & [buft, size] : model.memory_breakdown()) {
@@ -3842,6 +3865,11 @@ bool llama_set_input_tensor(llama_context * ctx, const char * name, const void *
 
 void llama_clear_input_tensor_bindings(llama_context * ctx) {
     ctx->clear_input_tensor_bindings();
+}
+
+size_t llama_get_input_tensor_size(llama_context * ctx, const char * name) {
+    if (!ctx || !name) return 0;
+    return ctx->get_input_tensor_size(name);
 }
 
 float * llama_get_embeddings_pre_norm_ith(llama_context * ctx, int32_t i) {

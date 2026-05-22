@@ -442,6 +442,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<float> mtp_attn_mask_buf;
     int64_t mtp_kv_len = 0;  // valid K positions, set by process() before each decode
 
+    // Persistent K/V padding buffers. The base context's captured K/V is sized
+    // to the cache's current n_kv (padded to multiples of 256), while the
+    // drafter graph's mtp_shared_K/V_* tensors are sized to n_ctx (= -c).
+    // For n_ctx > 256 the captured buffer is smaller than the bind target,
+    // so we copy the captured K/V into the head of a pre-sized pad buffer
+    // and zero-pad the tail. The attention mask already excludes padded rows.
+    std::vector<uint8_t> mtp_pad_K_swa, mtp_pad_V_swa, mtp_pad_K_full, mtp_pad_V_full;
+
     // Helper: rebind mtp_attn_mask to size n_ctx * n_batch_tokens, valid
     // positions [0..mtp_kv_len), -inf elsewhere. Must be called before EVERY
     // llama_decode(ctx_dft, batch) — the graph's mask tensor shape depends on
@@ -584,10 +592,35 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 if (K_swa && V_swa && K_full && V_full) {
                     const size_t bytes_swa  = n_swa  * sizeof(float);
                     const size_t bytes_full = n_full * sizeof(float);
-                    llama_set_input_tensor(ctx_dft, "mtp_shared_K_swa",  K_swa,  bytes_swa);
-                    llama_set_input_tensor(ctx_dft, "mtp_shared_V_swa",  V_swa,  bytes_swa);
-                    llama_set_input_tensor(ctx_dft, "mtp_shared_K_full", K_full, bytes_full);
-                    llama_set_input_tensor(ctx_dft, "mtp_shared_V_full", V_full, bytes_full);
+
+                    // Pad captured K/V up to the size the drafter graph
+                    // expects. When the cache's n_kv (paddded to 256) is
+                    // smaller than the graph's kv_max (= n_ctx), we copy the
+                    // captured bytes into the head of a larger buffer and
+                    // zero-pad the rest; the mtp_attn_mask masks the tail.
+                    auto pad_and_bind = [&](const char * tname,
+                                            const float * src, size_t src_bytes,
+                                            std::vector<uint8_t> & pad_buf) {
+                        const size_t need = llama_get_input_tensor_size(ctx_dft, tname);
+                        if (need == 0 || need == src_bytes) {
+                            llama_set_input_tensor(ctx_dft, tname, src, src_bytes);
+                            return;
+                        }
+                        if (need < src_bytes) {
+                            LOG_WRN("%s: %s: captured %zu B > graph %zu B; truncating\n",
+                                    __func__, tname, src_bytes, need);
+                            llama_set_input_tensor(ctx_dft, tname, src, need);
+                            return;
+                        }
+                        if (pad_buf.size() != need) pad_buf.assign(need, 0);
+                        else                       std::memset(pad_buf.data() + src_bytes, 0, need - src_bytes);
+                        std::memcpy(pad_buf.data(), src, src_bytes);
+                        llama_set_input_tensor(ctx_dft, tname, pad_buf.data(), need);
+                    };
+                    pad_and_bind("mtp_shared_K_swa",  K_swa,  bytes_swa,  mtp_pad_K_swa);
+                    pad_and_bind("mtp_shared_V_swa",  V_swa,  bytes_swa,  mtp_pad_V_swa);
+                    pad_and_bind("mtp_shared_K_full", K_full, bytes_full, mtp_pad_K_full);
+                    pad_and_bind("mtp_shared_V_full", V_full, bytes_full, mtp_pad_V_full);
 
                     // mtp_attn_mask: 0 for valid K positions [0..kv_len),
                     // -inf for padded tail. kv_len = main context's current

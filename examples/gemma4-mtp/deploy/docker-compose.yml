@@ -1,0 +1,72 @@
+services:
+  gemma4-mtp-server:
+    # Build from .devops/cuda.Dockerfile (multi-stage, server target).
+    # Override CUDA_DOCKER_ARCH for your GPU: 90 = H100, 89 = L40/4090,
+    # 86 = A6000/3090, 80 = A100. Defaults to "default" = all supported archs
+    # (longer build, fatter image).
+    build:
+      context: ../../..
+      dockerfile: .devops/cuda.Dockerfile
+      target: server
+      args:
+        CUDA_DOCKER_ARCH: ${CUDA_DOCKER_ARCH:-90}
+    image: gemma4-mtp-server:latest
+
+    container_name: gemma4-mtp-server
+    restart: unless-stopped
+
+    # NVIDIA Container Toolkit must be installed on the host.
+    # See https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              capabilities: [gpu]
+              # Set to the specific device id(s) you want to expose, or
+              # "all" to expose every visible GPU.
+              device_ids: ['${CUDA_DEVICE_ID:-0}']
+
+    # Mount the GGUFs read-only. Keep them outside the image so the image
+    # stays small and the models can be swapped without rebuilding.
+    volumes:
+      - ${MODELS_DIR:?MODELS_DIR is required (host path containing the GGUFs)}:/models:ro
+
+    ports:
+      - "${HOST_PORT:-8090}:8080"
+
+    # llama-server flags — adjust to taste.
+    # --api-key gates the OpenAI-compatible endpoint; OpenWebUI sends it as
+    # `Authorization: Bearer <key>`. Generate a strong random string and
+    # pass it via the .env file next to this compose.
+    command:
+      - "-m"
+      - "/models/${BASE_GGUF:-gemma-4-31B-it.gguf}"
+      - "-md"
+      - "/models/${DRAFT_GGUF:-gemma-4-31B-it-assistant.gguf}"
+      - "--spec-type"
+      - "draft-mtp"
+      - "-c"
+      - "${CONTEXT_SIZE:-8192}"
+      - "-ngl"
+      - "99"
+      - "-sm"
+      - "none"
+      - "-np"
+      - "${PARALLEL_SLOTS:-1}"
+      - "-fa"
+      - "on"
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "8080"
+      - "--api-key"
+      - "${API_KEY:?API_KEY is required}"
+
+    # llama-server's HEALTHCHECK already returns /health.
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 120s   # 31B fp16 + warmup can take ~60s to load

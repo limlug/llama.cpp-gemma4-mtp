@@ -1115,6 +1115,14 @@ extern "C" {
     // Drop all previously-set named bindings (e.g. before a fresh prompt).
     LLAMA_API void llama_clear_input_tensor_bindings(struct llama_context * ctx);
 
+    // Return the byte size that llama_set_input_tensor expects for `name`,
+    // i.e. ggml_nbytes() of the underlying graph input tensor. Returns 0
+    // if the name is not a recognized binding or the tensor isn't built
+    // yet. Useful for sizing a padding buffer when the captured K/V from
+    // the main context is smaller than the drafter's declared shape (e.g.
+    // n_kv padded to 256 while kv_max = n_ctx = 8192).
+    LLAMA_API size_t llama_get_input_tensor_size(struct llama_context * ctx, const char * name);
+
     // Attach a Multi-Token-Prediction (MTP) overlay onto an already-loaded
     // base model. The overlay file is a slim GGUF containing only the
     // mtp.* tensors and gemma4.mtp.* metadata (built via
