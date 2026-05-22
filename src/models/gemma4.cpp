@@ -795,13 +795,17 @@ llama_model_gemma4::graph_mtp::graph_mtp(
     const int64_t hd_swa         = (int64_t) hparams.mtp_n_embd_head_k;    // 256
     const int64_t hd_full        = (int64_t) hparams.mtp_global_head_dim;  // 512
 
-    // Match the KV cache's storage type (F16) so binding doesn't require
-    // per-decode dequant. The cross-attention math inside build_cross_attn_no_cache
-    // promotes to F32 via ggml_mul_mat_set_prec(GGML_PREC_F32).
-    ggml_tensor * shared_K_swa  = ggml_new_tensor_3d(ctx0, GGML_TYPE_F16, hd_swa,  mtp_n_kv_swa,  kv_max);
-    ggml_tensor * shared_V_swa  = ggml_new_tensor_3d(ctx0, GGML_TYPE_F16, hd_swa,  mtp_n_kv_swa,  kv_max);
-    ggml_tensor * shared_K_full = ggml_new_tensor_3d(ctx0, GGML_TYPE_F16, hd_full, mtp_n_kv_full, kv_max);
-    ggml_tensor * shared_V_full = ggml_new_tensor_3d(ctx0, GGML_TYPE_F16, hd_full, mtp_n_kv_full, kv_max);
+    // Match the base context's KV cache storage type so binding the
+    // captured K/V doesn't require per-decode dequant — the byte count
+    // check in process_ubatch's input-binding loop is exact-match. The
+    // cross-attention math inside build_cross_attn_no_cache promotes to
+    // F32 via ggml_mul_mat_set_prec(GGML_PREC_F32) regardless.
+    const ggml_type kv_type_k = cparams.cache_type_k;
+    const ggml_type kv_type_v = cparams.cache_type_v;
+    ggml_tensor * shared_K_swa  = ggml_new_tensor_3d(ctx0, kv_type_k, hd_swa,  mtp_n_kv_swa,  kv_max);
+    ggml_tensor * shared_V_swa  = ggml_new_tensor_3d(ctx0, kv_type_v, hd_swa,  mtp_n_kv_swa,  kv_max);
+    ggml_tensor * shared_K_full = ggml_new_tensor_3d(ctx0, kv_type_k, hd_full, mtp_n_kv_full, kv_max);
+    ggml_tensor * shared_V_full = ggml_new_tensor_3d(ctx0, kv_type_v, hd_full, mtp_n_kv_full, kv_max);
     ggml_set_input(shared_K_swa);  ggml_set_name(shared_K_swa,  "mtp_shared_K_swa");
     ggml_set_input(shared_V_swa);  ggml_set_name(shared_V_swa,  "mtp_shared_V_swa");
     ggml_set_input(shared_K_full); ggml_set_name(shared_K_full, "mtp_shared_K_full");

@@ -84,6 +84,8 @@ llama_context::llama_context(
     cparams.cb_eval_user_data = params.cb_eval_user_data;
 
     cparams.ctx_type          = params.ctx_type;
+    cparams.cache_type_k      = params.type_k;
+    cparams.cache_type_v      = params.type_v;
 
     // Initialize backend samplers here so they are part of the sampling graph
     // before the reserve passes run later in this function. This avoids a later

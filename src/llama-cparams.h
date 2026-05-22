@@ -46,6 +46,13 @@ struct llama_cparams {
     enum llama_context_type ctx_type;
     enum llama_pooling_type pooling_type;
 
+    // KV cache data types, threaded through from llama_context_params so the
+    // MTP drafter graph can size its shared K/V input tensors to match the
+    // base context's cache type (otherwise the byte-count check in
+    // llama_set_input_tensor rejects the binding when -ctk/-ctv aren't F16).
+    ggml_type cache_type_k;
+    ggml_type cache_type_v;
+
     ggml_backend_sched_eval_callback cb_eval;
     void * cb_eval_user_data;
 };
