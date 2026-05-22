@@ -475,7 +475,12 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
         }
 
         // TODO @ngxson : strip unused token right after the last KV layer to speed up prompt processing
-        if (il == n_layer - 1 && inp_out_ids) {
+        // When capturing the post-norm hidden state for the MTP drafter we
+        // DEFER this filter until after the final output norm — the drafter
+        // needs h at every prompt position to drive each verify step, not
+        // just the n_outputs sampled rows. The filter is re-applied below
+        // before lm_head so logits cost is unchanged.
+        if (il == n_layer - 1 && inp_out_ids && !capture_mtp_kv) {
             cur  = ggml_get_rows(ctx0,  cur, inp_out_ids);
             inpL = ggml_get_rows(ctx0, inpL, inp_out_ids);
         }
@@ -613,10 +618,21 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
     // mtp_h_input. We ggml_dup to ensure the scheduler treats this as a
     // compute node rather than a view (so the backend actually materializes
     // it for tensor_get_async). Only emitted when MTP capture is enabled.
+    //
+    // The capture happens BEFORE the output-row filter (which we deferred
+    // from layer n-1 above) so that t_last_hidden_state holds h for every
+    // prompt position, not just sampled outputs. The drafter needs h_t for
+    // each verify position; the previous implementation only captured 1 row
+    // for typical prompts, leaving batch.embd[1..] uninitialized.
     if (capture_mtp_kv) {
         res->t_last_hidden_state = ggml_dup(ctx0, cur);
         ggml_set_name(res->t_last_hidden_state, "mtp_last_hidden_state");
         ggml_build_forward_expand(gf, res->t_last_hidden_state);
+
+        // Now apply the deferred filter so lm_head only runs on output rows.
+        if (inp_out_ids) {
+            cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+        }
     }
 
     // lm_head

@@ -103,6 +103,38 @@ Verified on llm01 (`CUDA_VISIBLE_DEVICES=4`, H100 80 GB):
 * `-ngl 99 -sm none`: coherent gen, ~12.5 TPS, server stable
 * `-ngl 99 -sm layer` across 2 GPUs: coherent gen, ~13.4 TPS, server stable
 
+### Open: K/V capture only retains the first prompt ubatch (separable bug)
+
+When the prompt is processed in multiple ubatches (e.g. 6 tokens split
+2+4), the captured `t_shared_K_swa` / `V_swa` / `K_full` / `V_full`
+buffers used by the speculative driver only contain valid data for the
+**first** ubatch's positions. Verified by:
+
+1. Running `tools/real_flow_probe.py` to get HF's `(K_swa, V_swa,
+   K_full, V_full)` and `h_t` for "The capital of France is".
+2. Feeding those HF values into the C++ harness
+   (`test-gemma4-mtp-ref-diff`): drafter argmax = **50429 'Paris'**,
+   matches HF bit-equivalent (logit 24.1145, all layer cosines
+   essentially 1.0 except the documented F16 KV precision drop).
+3. Capturing `pending_h` from the live server: cos vs HF h_t =
+   **0.999994** → h_t plumbing is fine.
+4. Capturing K/V bytes the speculative driver hands to
+   `llama_set_input_tensor`: positions 0 and 1 match HF bit-exact
+   (cos=1.0 each), positions 2..5 are zeros. So the cache-view dup at
+   layer 58/59 only sees the first ubatch's writes.
+
+This is a graph-ordering / cache-view bug separate from today's GPU
+work. The capture (`ggml_dup(kv_swa->get_k(ctx0, il))` in
+`models/gemma4.cpp`) needs to either (a) be moved so it observes
+post-`cpy_k` cache state on every ubatch, (b) explicitly depend on
+the attention output `cur` so ggml's topological scheduler orders it
+after the K/V writes, or (c) the speculative driver needs to
+accumulate K/V across ubatches itself rather than relying on the
+graph capture being complete.
+
+Once that's fixed, GPU and CPU should both reach the meaningful
+acceptance rates that HF's `assistant_model=` gets.
+
 ### Acceptance rate: 0% across CPU and GPU on this build
 
 Comparing draft-candidate logs from `--verbose` runs on CPU
