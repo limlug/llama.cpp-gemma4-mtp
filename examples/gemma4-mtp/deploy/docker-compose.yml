@@ -2,12 +2,11 @@ services:
   gemma4-mtp-server:
     # Build from .devops/cuda.Dockerfile (multi-stage, server target).
     # Override CUDA_DOCKER_ARCH for your GPU: 90 = H100, 89 = L40/4090,
-    # 86 = A6000/3090, 80 = A100. Defaults to "default" = all supported archs
-    # (longer build, fatter image).
+    # 86 = A6000/3090, 80 = A100. Defaults to "default" = all supported
+    # archs (longer build, fatter image).
     build:
       context: ../../..
-      dockerfile: .devops/cuda.Dockerfile
-      target: server
+      dockerfile: examples/gemma4-mtp/deploy/Dockerfile
       args:
         CUDA_DOCKER_ARCH: ${CUDA_DOCKER_ARCH:-90}
     image: gemma4-mtp-server:latest
@@ -15,17 +14,15 @@ services:
     container_name: gemma4-mtp-server
     restart: unless-stopped
 
-    # NVIDIA Container Toolkit must be installed on the host.
-    # See https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/.
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              capabilities: [gpu]
-              # Set to the specific device id(s) you want to expose, or
-              # "all" to expose every visible GPU.
-              device_ids: ['${CUDA_DEVICE_ID:-0}']
+    # NVIDIA Container Runtime must be installed on the host
+    # (https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/).
+    # This works for both docker-compose v1 (non-swarm) and v2.
+    runtime: nvidia
+    environment:
+      # Restrict the container to a specific GPU. Use "all" to expose
+      # every visible GPU, or a comma-separated list like "0,1".
+      NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-0}
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
 
     # Mount the GGUFs read-only. Keep them outside the image so the image
     # stays small and the models can be swapped without rebuilding.
@@ -36,9 +33,9 @@ services:
       - "${HOST_PORT:-8090}:8080"
 
     # llama-server flags — adjust to taste.
-    # --api-key gates the OpenAI-compatible endpoint; OpenWebUI sends it as
-    # `Authorization: Bearer <key>`. Generate a strong random string and
-    # pass it via the .env file next to this compose.
+    # --api-key gates the OpenAI-compatible endpoint; OpenWebUI sends it
+    # as `Authorization: Bearer <key>`. Generate a strong random string
+    # and pass it via the .env file next to this compose.
     command:
       - "-m"
       - "/models/${BASE_GGUF:-gemma-4-31B-it.gguf}"
@@ -56,6 +53,12 @@ services:
       - "${PARALLEL_SLOTS:-1}"
       - "-fa"
       - "on"
+      # Skip the Gemma-4-it default thinking step. With reasoning enabled,
+      # time-to-first-token is 60+ seconds and the answer is dwarfed by the
+      # `reasoning_content` payload. For interactive chat this is too slow;
+      # set REASONING_MODE=on (or auto) in .env to opt back in.
+      - "--reasoning"
+      - "${REASONING_MODE:-off}"
       - "--host"
       - "0.0.0.0"
       - "--port"
@@ -63,7 +66,6 @@ services:
       - "--api-key"
       - "${API_KEY:?API_KEY is required}"
 
-    # llama-server's HEALTHCHECK already returns /health.
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8080/health"]
       interval: 30s
