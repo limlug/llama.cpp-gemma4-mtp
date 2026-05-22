@@ -146,7 +146,14 @@ Layer-tap cosines after the fix (server vs HF reference, real flow):
 The residual ~0.95 cos at `L0.attn_out_pre_o_proj` is the documented
 F16 cross-attention precision drop with GQA — fundamental to how the
 real-flow K/V cache is stored. It's enough to let plenty of drafts
-through; F32 KV cache would close the remaining gap if needed.
+through.
+
+**F32 KV cache (`-ctk f32 -ctv f32`) doesn't help.** 7-prompt sweep
+overall: F16 = 4.8% (26/541), F32 = 4.2% (23/546). The drafter quality
+is the binding constraint, not F16 precision. The plumbing to allow
+F32 was added anyway (commit c35ec1e — `cparams.cache_type_k/v` ➜
+graph_mtp's shared tensor declarations) so users can experiment
+without hitting size-mismatch errors.
 
 ### Diagnostic notes that led to the fix (for posterity)
 
