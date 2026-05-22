@@ -103,77 +103,72 @@ Verified on llm01 (`CUDA_VISIBLE_DEVICES=4`, H100 80 GB):
 * `-ngl 99 -sm none`: coherent gen, ~12.5 TPS, server stable
 * `-ngl 99 -sm layer` across 2 GPUs: coherent gen, ~13.4 TPS, server stable
 
-### Open: K/V capture only retains the first prompt ubatch (separable bug)
+### V-layout fix (2026-05-22): drafter now produces meaningful drafts
 
-When the prompt is processed in multiple ubatches (e.g. 6 tokens split
-2+4), the captured `t_shared_K_swa` / `V_swa` / `K_full` / `V_full`
-buffers used by the speculative driver only contain valid data for the
-**first** ubatch's positions. Verified by:
+The remaining 0%-acceptance issue was a V-layout bug in the base graph's
+K/V capture. The base KV cache stores V in `v_trans=true` order
+(`[n_ctx, n_head_kv, hd]`, n_ctx is the FASTEST-varying dim), but the
+MTP drafter graph declares `mtp_shared_V_*` as `[hd, n_head_kv, n_ctx]`
+(hd fastest). The previous capture `ggml_dup(kv->get_v(ctx0, il))`
+produced bytes in cache-native order; the speculative driver's
+`llama_set_input_tensor` bit-copied those bytes into the drafter's
+differently-shaped tensor, causing every V element to be misinterpreted
+in the cross-attention. K's layout already matched, so K was fine.
 
-1. Running `tools/real_flow_probe.py` to get HF's `(K_swa, V_swa,
-   K_full, V_full)` and `h_t` for "The capital of France is".
-2. Feeding those HF values into the C++ harness
-   (`test-gemma4-mtp-ref-diff`): drafter argmax = **50429 'Paris'**,
-   matches HF bit-equivalent (logit 24.1145, all layer cosines
-   essentially 1.0 except the documented F16 KV precision drop).
-3. Capturing `pending_h` from the live server: cos vs HF h_t =
-   **0.999994** → h_t plumbing is fine.
-4. Capturing K/V bytes the speculative driver hands to
-   `llama_set_input_tensor`: positions 0 and 1 match HF bit-exact
-   (cos=1.0 each), positions 2..5 are zeros. So the cache-view dup at
-   layer 58/59 only sees the first ubatch's writes.
+Fix: in `models/gemma4.cpp` capture, ggml_permute V back to canonical
+`[hd, n_head_kv, n_ctx]` before ggml_dup:
 
-This is a graph-ordering / cache-view bug separate from today's GPU
-work. The capture (`ggml_dup(kv_swa->get_k(ctx0, il))` in
-`models/gemma4.cpp`) needs to either (a) be moved so it observes
-post-`cpy_k` cache state on every ubatch, (b) explicitly depend on
-the attention output `cur` so ggml's topological scheduler orders it
-after the K/V writes, or (c) the speculative driver needs to
-accumulate K/V across ubatches itself rather than relying on the
-graph capture being complete.
-
-Once that's fixed, GPU and CPU should both reach the meaningful
-acceptance rates that HF's `assistant_model=` gets.
-
-### Acceptance rate: 0% across CPU and GPU on this build
-
-Comparing draft-candidate logs from `--verbose` runs on CPU
-(`-ngl 0`) and GPU (`-ngl 99`) with the same prompt
-("The capital of France is", `-c 256`, temperature 0):
-
-```
-                          CPU                          GPU
-pos 0  top1: 4686 'ем'  (p=0.187)  | 4686 'ем'  (p=0.226)
-       top2:  568 ' ('  (p=0.182)  |  900 ' +'  (p=0.179)
-       top3:  900 ' +'  (p=0.176)  |  568 ' ('  (p=0.172)
-pos 1  top1:  506 ' the' (p=0.514) |  506 ' the' (p=0.635)
-pos 2  top1: 236789 '''  (p=0.482) | 236789 '''  (p=0.773)
-…
+```cpp
+ggml_tensor * v_perm = ggml_permute(ctx0, raw_V, 2, 1, 0, 3);
+res->t_shared_V_* = ggml_cont(ctx0, v_perm);
 ```
 
-Same token IDs in nearly the same order with very similar
-probabilities — small differences are F16 noise, but the ranking is
-preserved. **No GPU-specific regression.** Both backends produce the
-same low-confidence near-uniform distribution that the base model
-never accepts.
+End-to-end results on llm01:
 
-This contradicts an earlier documented "8.3% on CPU" measurement; that
-figure was either prompt-specific or measured on a slightly different
-build/state and is not reproducible on this commit. The current
-behavior aligns with `gemma4_mtp_cli_integration` notes: "0%
-acceptance is intrinsic to drafter quality (HF generate also
-degenerate on standalone prompts)."
+| Prompt | CPU rate | GPU rate | GPU TPS |
+|---|---|---|---|
+| "The capital of France is" | 6.8% | 8.6% | 14.6 |
+| "Once upon a time, there was a" | 6.9% | 10.0% | 11.1 |
+| "def fibonacci(n):" | 5.2% | 5.2% | 7.8 |
 
-Open question if/when the drafter is to be made useful:
+Layer-tap cosines after the fix (server vs HF reference, real flow):
 
-* Is the drafter actually intrinsically weak on these prompts, or is
-  there a remaining math bug (e.g. mask, h_in, KV provenance) that
-  flattens its logits across the board? Cross-checking against HF's
-  `assistant_model=` generation on the exact same tokens would
-  disambiguate. If HF also produces uniform-ish drafter logits → the
-  drafter is the limit; if HF gets concentrated logits and accepts
-  drafts → our port still has a math bug despite the bit-exact
-  synthetic-input numbers.
+| Tap | cos |
+|---|---|
+| `pre_projection` | 0.999990 |
+| `L0.input_layernorm` | 0.999990 |
+| `L0.q_norm` | 0.999994 |
+| `L0.attn_out_pre_o_proj` | **0.955** (was 0.0008 pre-fix) |
+| `L0.o_proj` | 0.993 |
+| `model.norm` | 0.991 |
+| `post_projection` | 0.991 |
+
+The residual ~0.95 cos at `L0.attn_out_pre_o_proj` is the documented
+F16 cross-attention precision drop with GQA — fundamental to how the
+real-flow K/V cache is stored. It's enough to let plenty of drafts
+through; F32 KV cache would close the remaining gap if needed.
+
+### Diagnostic notes that led to the fix (for posterity)
+
+The root cause was localized via incremental instrumentation:
+
+1. `tools/real_flow_probe.py` showed HF predicts 'Paris' (50429)
+   concentrated.
+2. The C++ diff harness (`tests/test-gemma4-mtp-ref-diff`) with HF
+   inputs gave the same 50429 — so drafter math is correct.
+3. Dumping `pending_h` from the live server: cos vs HF h_t =
+   0.999994 → h_t plumbing fine.
+4. Earlier deferred output-row filter so `t_last_hidden_state`
+   spans all prompt positions (commit b2d032c).
+5. Dumping K/V bytes during the actual draft call (not the earlier
+   per-process binding): cos vs HF = 1.0 for all 6 positions — so
+   the data values are correct, just not the layout.
+6. Dumping per-layer drafter taps from the server: cos drops from
+   ~1.0 at `q_norm` to 0.0008 at `attn_out_pre_o_proj` — divergence
+   is in the cross-attention, not the inputs.
+7. Reading `t->ne` and `t->nb` for the captured V tensors revealed
+   `ne[0]=n_ctx` (= v_trans=true layout) while the MTP graph
+   declared V with `ne[0]=hd`. Patched the capture to ggml_permute.
 
 ### Sanity check that should be re-run before declaring this fully done
 

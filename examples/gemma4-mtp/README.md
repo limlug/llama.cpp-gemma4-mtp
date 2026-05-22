@@ -23,11 +23,11 @@ E2B and 31B variants. Diff harness with seeded synthetic inputs:
 
 End-to-end speculative decoding via `llama-server` produces coherent text:
 
-| Model | Backend | Acceptance rate |
-|---|---|---|
-| E2B-it-assistant | CPU + GPU | 0% (intrinsic — drafter weak on standalone prompts) |
-| 31B-it-assistant | CPU | **8.3%** ("The capital of France is" → "Paris.\\n\\nThe capital of France is Paris...") |
-| 31B-it-assistant | GPU (`-ngl 99`) | crashes during init — see `docs/31B_STATUS.md` |
+| Model | Backend | Acceptance rate | TPS |
+|---|---|---|---|
+| E2B-it-assistant | CPU + GPU | 0% (intrinsic — drafter weak on standalone prompts) | — |
+| 31B-it-assistant | CPU (`-ngl 0`)  | 5–7% on common prompts | ~1.9 |
+| 31B-it-assistant | GPU (`-ngl 99`) | **5–10%** | **8–15** |
 
 See `docs/` for the design and per-bug post-mortems.
 

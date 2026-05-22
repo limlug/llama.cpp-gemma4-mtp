@@ -425,41 +425,40 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
                 // Materialize copies of the cache views via ggml_dup so the
                 // backend scheduler tracks them and they appear as real
                 // compute nodes (the raw view tensors are not registered).
+                // Capture K/V from the cache view. The base KV cache stores V
+                // in the v_trans=true layout [n_ctx, n_head_kv, hd] (n_ctx is
+                // the FASTEST-varying dim), while the MTP drafter graph
+                // declares mtp_shared_V_* as [hd, n_head_kv, n_ctx] (hd is
+                // fastest). A bit-copy from the cache dup into mtp_shared_V_*
+                // would misinterpret the data. So we ggml_permute V back to
+                // [hd, n_head_kv, n_ctx] before ggml_dup. K is fine — it's
+                // stored with the same layout the drafter expects.
+                auto capture_v = [&](ggml_tensor * raw_V) -> ggml_tensor * {
+                    if (!raw_V) return nullptr;
+                    // ne[0]=n_ctx (v_trans), ne[1]=n_head_kv, ne[2]=hd → permute
+                    // to (hd, n_head_kv, n_ctx) i.e. swap axes 0 and 2.
+                    ggml_tensor * v_perm = ggml_permute(ctx0, raw_V, 2, 1, 0, 3);
+                    return ggml_cont(ctx0, v_perm);
+                };
                 if (il == last_kv_swa) {
-                    fprintf(stderr, "[DBG-B] il=%d entering swa branch\n", il);
                     const auto * kv_swa = inp_attn->mctx->get_swa();
-                    fprintf(stderr, "[DBG-C] il=%d kv_swa=%p\n", il, (const void*)kv_swa);
                     if (kv_swa) {
                         ggml_tensor * raw_K = kv_swa->get_k(ctx0, il);
                         ggml_tensor * raw_V = kv_swa->get_v(ctx0, il);
-                        fprintf(stderr, "[DBG-D] il=%d swa: raw_K=%p (ne=[%lld,%lld,%lld]) raw_V=%p\n",
-                            il, (const void*)raw_K,
-                            raw_K ? (long long)raw_K->ne[0] : 0LL,
-                            raw_K ? (long long)raw_K->ne[1] : 0LL,
-                            raw_K ? (long long)raw_K->ne[2] : 0LL,
-                            (const void*)raw_V);
                         res->t_shared_K_swa = ggml_dup(ctx0, raw_K);
-                        res->t_shared_V_swa = ggml_dup(ctx0, raw_V);
+                        res->t_shared_V_swa = capture_v(raw_V);
                         cb(res->t_shared_K_swa, "mtp_shared_K_swa", il);
                         cb(res->t_shared_V_swa, "mtp_shared_V_swa", il);
                         ggml_build_forward_expand(gf, res->t_shared_K_swa);
                         ggml_build_forward_expand(gf, res->t_shared_V_swa);
                     }
                 } else if (il == last_kv_full) {
-                    fprintf(stderr, "[DBG-E] il=%d entering full branch\n", il);
                     const auto * kv_base = inp_attn->mctx->get_base();
-                    fprintf(stderr, "[DBG-F] il=%d kv_base=%p\n", il, (const void*)kv_base);
                     if (kv_base) {
                         ggml_tensor * raw_K = kv_base->get_k(ctx0, il);
                         ggml_tensor * raw_V = kv_base->get_v(ctx0, il);
-                        fprintf(stderr, "[DBG-G] il=%d full: raw_K=%p (ne=[%lld,%lld,%lld]) raw_V=%p\n",
-                            il, (const void*)raw_K,
-                            raw_K ? (long long)raw_K->ne[0] : 0LL,
-                            raw_K ? (long long)raw_K->ne[1] : 0LL,
-                            raw_K ? (long long)raw_K->ne[2] : 0LL,
-                            (const void*)raw_V);
                         res->t_shared_K_full = ggml_dup(ctx0, raw_K);
-                        res->t_shared_V_full = ggml_dup(ctx0, raw_V);
+                        res->t_shared_V_full = capture_v(raw_V);
                         cb(res->t_shared_K_full, "mtp_shared_K_full", il);
                         cb(res->t_shared_V_full, "mtp_shared_V_full", il);
                         ggml_build_forward_expand(gf, res->t_shared_K_full);
